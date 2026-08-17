@@ -30,8 +30,8 @@ from sklearn.decomposition import PCA
 # Global configuration -- edit values here; no CLI arguments are used
 # =============================================================================
 
-MODEL_PATH = ""
-HRBENCH_PATH = ""
+MODEL_PATH = "/home/fit/renjujty/jty/lmllms/ilvr/"
+HRBENCH_PATH = "/home/fit/renjujty/jty/lmllms/hrbench/hr_bench_4k.parquet"
 OUTPUT_DIR = "outputs/hrbench_pca"
 CACHE_DIR: str | None = None
 
@@ -44,7 +44,7 @@ RUN_CONFIG_FILE = "run_config.json"
 # "random": deterministic sampling without replacement using RANDOM_SEED
 SELECTION_MODE = "random"
 START_INDEX = 0
-NUM_SAMPLES = 100
+NUM_SAMPLES = 10
 RANDOM_SEED = 0
 
 DEVICE_MAP = "auto"
