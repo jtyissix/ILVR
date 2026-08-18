@@ -19,6 +19,7 @@ import re
 import shutil
 import sys
 import tempfile
+import warnings
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
@@ -46,9 +47,9 @@ LATENT_TOPK_CSV_FILE = "latent_topk.csv"
 ATTENTION_SUBDIR = "attention"
 PLOT_SUBDIR = "plots"
 
-SELECTION_MODE = "random"
+SELECTION_MODE = "sequential"
 START_INDEX = 0
-NUM_SAMPLES = 800
+NUM_SAMPLES = 1
 RANDOM_SEED = 0
 
 DEVICE_MAP = "auto"
@@ -816,12 +817,20 @@ def assemble_sample_archive(
                     ],
                     axis=-1,
                 )
-                if not np.allclose(
-                    visible_mass.sum(axis=-1), 1.0, atol=1e-5, rtol=1e-5
-                ):
-                    raise RuntimeError(
+                visible_total = visible_mass.sum(axis=-1)
+                invalid_layers = ~np.isclose(
+                    visible_total, 1.0, atol=1e-5, rtol=1e-5
+                )
+                if invalid_layers.any():
+                    layer_indices = np.flatnonzero(invalid_layers).tolist()
+                    normalized[invalid_layers, :] = np.nan
+                    visible_mass[invalid_layers, :] = np.nan
+                    warnings.warn(
                         "Target attention categories cannot be normalized at "
-                        f"query position {record['query_sequence_position']}."
+                        f"query position {record['query_sequence_position']} for "
+                        f"decoder layers {layer_indices}; storing NaN and continuing.",
+                        RuntimeWarning,
+                        stacklevel=2,
                     )
                 complete_mass = np.stack(
                     [
@@ -1491,7 +1500,8 @@ def main() -> None:
                 "raw_attention": "[decoder_layer, concatenated_ragged_source]",
                 "group_normalized_attention": (
                     "latent: input_text+input_visual; answer: "
-                    "input_text+input_visual+latent+cot_text"
+                    "input_text+input_visual+latent+cot_text; unavailable "
+                    "query/layer rows are NaN"
                 ),
                 "answer_alignment": "query that predicted each answer token",
             },

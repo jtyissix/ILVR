@@ -253,6 +253,61 @@ class AttentionAnalysisTest(unittest.TestCase):
             self.assertEqual(int(data["query_latent_block_indices"][0]), 0)
             self.assertEqual(int(data["query_latent_indices"][0]), 0)
 
+    def test_archive_keeps_raw_attention_when_target_mass_is_zero(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            latent_ids = {"pad": 99, "start": 100, "end": 101}
+            valid = np.asarray([[0.5, 0.5], [0.4, 0.6]], dtype=np.float32)
+            invalid = np.asarray(
+                [[0.0, 0.0, 1.0], [0.0, 0.0, 1.0]], dtype=np.float32
+            )
+            (directory / "latent.bin").write_bytes(b"")
+            (directory / "answer.bin").write_bytes(valid.tobytes() + invalid.tobytes())
+            manifest = {
+                "storage_dtype": "float32",
+                "layer_count": 2,
+                "prompt_length": 2,
+                "prompt_token_ids": [1, 2],
+                "generated_token_ids": [7, 8],
+                "image_positions": [1],
+                "special_token_ids": [99, 100, 101],
+                "latent_records": [],
+                "answer_records": [
+                    {
+                        "query_sequence_position": 1,
+                        "source_count": 2,
+                        "layer_count": 2,
+                        "offset": 0,
+                    },
+                    {
+                        "query_sequence_position": 2,
+                        "source_count": 3,
+                        "layer_count": 2,
+                        "offset": 4,
+                    },
+                ],
+                "latent_topk": [],
+                "latent_spool": "latent.bin",
+                "answer_spool": "answer.bin",
+                "no_latent_fallback": True,
+            }
+
+            with self.assertWarnsRegex(RuntimeWarning, "storing NaN and continuing"):
+                data = analysis.assemble_sample_archive(
+                    manifest, directory, latent_ids
+                )
+
+            np.testing.assert_allclose(
+                data["raw_attention"][:, -3:],
+                [[0.0, 0.0, 1.0], [0.0, 0.0, 1.0]],
+            )
+            self.assertTrue(
+                np.isnan(data["group_normalized_attention"][:, -3:]).all()
+            )
+            self.assertTrue(
+                np.isnan(data["category_attention_distribution"][1]).all()
+            )
+
 
 if __name__ == "__main__":
     unittest.main()
