@@ -736,6 +736,73 @@ class Qwen2_5_VLAttention(nn.Module):
 
         self.rotary_emb = Qwen2_5_VLRotaryEmbedding(config=config)
 
+    def _record_ilvr_analysis_attention(
+        self,
+        query_states: torch.Tensor,
+        key_states: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
+        sliding_window: Optional[int] = None,
+    ) -> None:
+        """Record one head-mean query without changing the model output.
+
+        The analysis recorder is installed only by the standalone ILVR
+        attention-analysis script.  Keeping this hook private and opt-in makes
+        the normal training and inference paths identical to their previous
+        behavior.  ``query_states`` and ``key_states`` must already include
+        M-RoPE and have shape ``[batch, heads, sequence, head_dim]``.
+        """
+        recorder = getattr(self, "_ilvr_attention_recorder", None)
+        if recorder is None or not recorder.wants_current_step():
+            return
+        if query_states.ndim != 4 or key_states.ndim != 4:
+            raise RuntimeError(
+                "ILVR attention analysis expected rank-four query/key tensors."
+            )
+
+        key_length = int(key_states.shape[-2])
+        source_start = 0
+        if sliding_window is not None and int(sliding_window) > 0:
+            source_start = max(0, key_length - int(sliding_window))
+
+        query = query_states[:, :, -1:, :].float()
+        keys = key_states[:, :, source_start:, :].float()
+        logits = torch.matmul(query, keys.transpose(2, 3)) / math.sqrt(self.head_dim)
+
+        if attention_mask is not None:
+            if attention_mask.ndim == 4:
+                selected_mask = attention_mask[:, :, -1:, source_start:key_length]
+                selected_mask = selected_mask.to(device=logits.device)
+                if selected_mask.dtype == torch.bool:
+                    logits = logits.masked_fill(
+                        ~selected_mask, torch.finfo(logits.dtype).min
+                    )
+                else:
+                    logits = logits + selected_mask.to(dtype=logits.dtype)
+            elif attention_mask.ndim == 2:
+                selected_mask = attention_mask[:, source_start:key_length].to(
+                    device=logits.device
+                )
+                logits = logits.masked_fill(
+                    ~selected_mask.to(dtype=torch.bool)[:, None, None, :],
+                    torch.finfo(logits.dtype).min,
+                )
+            else:
+                raise RuntimeError(
+                    "ILVR attention analysis supports only 2D or 4D attention masks."
+                )
+
+        probabilities = torch.softmax(logits, dim=-1, dtype=torch.float32)
+        head_mean = probabilities.mean(dim=1)[:, 0, :]
+        if source_start:
+            full = torch.zeros(
+                (head_mean.shape[0], key_length),
+                device=head_mean.device,
+                dtype=head_mean.dtype,
+            )
+            full[:, source_start:] = head_mean
+            head_mean = full
+        recorder.record_layer_attention(int(self.layer_idx), head_mean)
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -784,6 +851,11 @@ class Qwen2_5_VLAttention(nn.Module):
         # upcast attention to fp32
         attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
         attn_weights = nn.functional.dropout(attn_weights, p=self.attention_dropout, training=self.training)
+        recorder = getattr(self, "_ilvr_attention_recorder", None)
+        if recorder is not None and recorder.wants_current_step():
+            recorder.record_layer_attention(
+                int(self.layer_idx), attn_weights[:, :, -1, :].float().mean(dim=1)
+            )
         attn_output = torch.matmul(attn_weights, value_states)
 
         if attn_output.size() != (bsz, self.num_heads, q_len, self.head_dim):
@@ -894,6 +966,16 @@ class Qwen2_5_VLFlashAttention2(Qwen2_5_VLAttention):
         else:
             sliding_window = None
 
+        # FlashAttention does not expose probabilities.  Reconstruct only the
+        # current query from the exact post-RoPE Q/K tensors when an analysis
+        # recorder is installed; the regular path pays no additional cost.
+        self._record_ilvr_analysis_attention(
+            query_states.transpose(1, 2),
+            key_states.transpose(1, 2),
+            attention_mask=attention_mask,
+            sliding_window=sliding_window,
+        )
+
         attn_output = _flash_attention_forward(
             query_states,
             key_states,
@@ -986,6 +1068,13 @@ class Qwen2_5_VLFlashAttention2(Qwen2_5_VLAttention):
             sliding_window = self.config.sliding_window
         else:
             sliding_window = None
+
+        self._record_ilvr_analysis_attention(
+            query_states.transpose(1, 2),
+            key_states.transpose(1, 2),
+            attention_mask=attention_mask,
+            sliding_window=sliding_window,
+        )
 
         attn_output = _flash_attention_forward(
             query_states,

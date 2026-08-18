@@ -3295,10 +3295,22 @@ class GenerationMixin:
         # MAX_LATENT_LEN = 8
         MAX_LATENT_LEN = int(getattr(self.config, "latent_size", 8))
         cur_bs = input_ids.shape[0]
+        ilvr_attention_recorder = getattr(self, "_ilvr_attention_recorder", None)
+        initial_prompt_length = cur_len
+        if ilvr_attention_recorder is not None:
+            # The recorder intentionally performs Python callbacks and streams
+            # CPU data, so this analysis-only path must not use torch.compile.
+            model_forward = self.__call__
+            ilvr_attention_recorder.begin_generation(
+                model=self,
+                prompt_input_ids=input_ids,
+                latent_size=MAX_LATENT_LEN,
+            )
 
         while self._has_unfinished_sequences(
             this_peer_finished, synced_gpus, device=input_ids.device, cur_len=cur_len, max_length=max_length
         ):
+            consumes_latent_embedding = in_latent_mode and not latent_start
             if not in_latent_mode:              
                 model_inputs = self.prepare_inputs_for_generation(input_ids, **model_kwargs)
             else:
@@ -3313,6 +3325,19 @@ class GenerationMixin:
             # prepare variable output controls (note: some models won't accept all output controls)
             model_inputs.update({"output_attentions": output_attentions} if output_attentions else {})
             model_inputs.update({"output_hidden_states": output_hidden_states} if output_hidden_states else {})
+
+            if ilvr_attention_recorder is not None:
+                ilvr_attention_recorder.begin_step(
+                    model=self,
+                    query_sequence_position=cur_len - 1,
+                    output_index=cur_len - initial_prompt_length,
+                    is_latent_query=consumes_latent_embedding,
+                    latent_vector=(
+                        model_inputs.get("inputs_embeds")
+                        if consumes_latent_embedding
+                        else None
+                    ),
+                )
 
             if is_prefill:
                 outputs = self(**model_inputs, return_dict=True, generate_mode=True)
@@ -3426,6 +3451,11 @@ class GenerationMixin:
             
             else:
                 input_ids = torch.cat([input_ids, next_tokens[:, None]], dim=-1)   
+
+            if ilvr_attention_recorder is not None:
+                ilvr_attention_recorder.end_step(
+                    predicted_token_ids=next_tokens,
+                )
             
             if streamer is not None:
                 streamer.put(next_tokens.cpu())
@@ -3443,6 +3473,9 @@ class GenerationMixin:
 
         if streamer is not None:
             streamer.end()
+
+        if ilvr_attention_recorder is not None:
+            ilvr_attention_recorder.end_generation(input_ids=input_ids)
 
         if return_dict_in_generate:
             if self.config.is_encoder_decoder:

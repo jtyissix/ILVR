@@ -20,11 +20,12 @@ import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable
-
+import os
 import numpy as np
 from PIL import Image
 from sklearn.decomposition import PCA
 
+os.environ["CUDA_VISIBLE_DEVICES"] = "0,1,6,7"  # Limit to one GPU for reproducibility
 
 # =============================================================================
 # Global configuration -- edit values here; no CLI arguments are used
