@@ -774,7 +774,7 @@ def assemble_sample_archive(
     raw_masses: list[np.ndarray] = []
 
     streams = [
-        ("latent", QUERY_LATENT, (SOURCE_INPUT_TEXT, SOURCE_INPUT_VISUAL)),
+        ("latent", QUERY_LATENT, TARGET_SOURCE_CODES),
         ("answer", QUERY_ANSWER, TARGET_SOURCE_CODES),
     ]
     for stream, query_kind, target_codes in streams:
@@ -978,11 +978,7 @@ def plot_attention_heatmap(
         end = int(data["query_source_offsets"][query_index + 1])
         positions = data["source_sequence_positions"][start:end]
         kinds = data["source_kind_codes"][start:end]
-        allowed = (
-            np.isin(kinds, (SOURCE_INPUT_TEXT, SOURCE_INPUT_VISUAL))
-            if query_kind == QUERY_LATENT
-            else np.isin(kinds, TARGET_SOURCE_CODES)
-        )
+        allowed = np.isin(kinds, TARGET_SOURCE_CODES)
         selected_positions = positions[allowed]
         raw[row, selected_positions] = data["raw_attention"][layer_index, start:end][
             allowed
@@ -1499,9 +1495,8 @@ def main() -> None:
                 "query_kind_names": QUERY_KIND_NAMES.tolist(),
                 "raw_attention": "[decoder_layer, concatenated_ragged_source]",
                 "group_normalized_attention": (
-                    "latent: input_text+input_visual; answer: "
-                    "input_text+input_visual+latent+cot_text; unavailable "
-                    "query/layer rows are NaN"
+                    "latent and answer: input_text+input_visual+latent+cot_text; "
+                    "unavailable query/layer rows are NaN"
                 ),
                 "answer_alignment": "query that predicted each answer token",
             },

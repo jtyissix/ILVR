@@ -248,6 +248,14 @@ class AttentionAnalysisTest(unittest.TestCase):
                 1.0,
                 atol=1e-6,
             )
+            self.assertTrue(
+                np.all(
+                    data["category_attention_distribution"][
+                        0, :, analysis.SOURCE_LATENT
+                    ]
+                    > 0
+                )
+            )
             # The answer query can see the previous answer source only on later
             # answer tokens; it is never folded into cot_text.
             self.assertEqual(int(data["query_latent_block_indices"][0]), 0)
