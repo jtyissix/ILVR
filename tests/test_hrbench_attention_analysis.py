@@ -37,6 +37,19 @@ class FakeModel:
 
 
 class AttentionAnalysisTest(unittest.TestCase):
+    def test_finite_mean_ignores_unavailable_attention_rows(self):
+        values = np.asarray(
+            [
+                [[1.0, np.nan], [3.0, np.nan]],
+                [[5.0, 7.0], [np.nan, 9.0]],
+            ],
+            dtype=np.float32,
+        )
+        np.testing.assert_allclose(
+            analysis.finite_mean(values, axis=0),
+            [[3.0, 7.0], [3.0, 9.0]],
+        )
+
     def test_selection_is_deterministic(self):
         self.assertEqual(
             analysis.select_sample_indices(20, "random", 0, 5, 7),

@@ -953,6 +953,17 @@ def query_label(data: dict[str, np.ndarray], tokenizer: Any, index: int) -> str:
     return f"answer:{token_piece(tokenizer, token_id)}@{position}"
 
 
+def finite_mean(values: np.ndarray, axis: int) -> np.ndarray:
+    """Compute a mean while ignoring unavailable (NaN/inf) attention rows."""
+    array = np.asarray(values, dtype=np.float32)
+    finite = np.isfinite(array)
+    counts = finite.sum(axis=axis)
+    totals = np.where(finite, array, 0.0).sum(axis=axis, dtype=np.float32)
+    result = np.full(totals.shape, np.nan, dtype=np.float32)
+    np.divide(totals, counts, out=result, where=counts > 0)
+    return result
+
+
 def plot_attention_heatmap(
     data: dict[str, np.ndarray], tokenizer: Any, query_kind: int, path: Path
 ) -> None:
@@ -1032,6 +1043,43 @@ def plot_category_attention(
     axis.set_title(f"Target category attention, layer {layer_index}")
     figure.colorbar(image, ax=axis, fraction=0.03)
     figure.tight_layout()
+    figure.savefig(path, dpi=PLOT_DPI, bbox_inches="tight")
+    plt.close(figure)
+
+
+def plot_category_attention_by_layer(
+    data: dict[str, np.ndarray], path: Path
+) -> None:
+    """Plot query-mean category attention separately for every decoder layer."""
+    if not WRITE_PLOTS or not len(data["query_kind_codes"]):
+        return
+    import matplotlib.pyplot as plt
+
+    masses = data["category_attention_distribution"]
+    layer_count = masses.shape[1]
+    figure, axes = plt.subplots(
+        1,
+        2,
+        figsize=(PLOT_FIGURE_WIDTH, max(5.0, 0.32 * layer_count)),
+        constrained_layout=True,
+    )
+    for axis, query_kind in zip(axes, (QUERY_LATENT, QUERY_ANSWER)):
+        indices = np.flatnonzero(data["query_kind_codes"] == query_kind)
+        if not len(indices):
+            axis.axis("off")
+            continue
+        matrix = finite_mean(masses[indices], axis=0)
+        image = axis.imshow(
+            matrix, aspect="auto", interpolation="nearest", vmin=0.0, vmax=1.0
+        )
+        axis.set_xticks(np.arange(len(TARGET_KIND_NAMES)))
+        axis.set_xticklabels(TARGET_KIND_NAMES.tolist(), rotation=25, ha="right")
+        axis.set_yticks(np.arange(layer_count))
+        axis.set_ylabel("decoder layer")
+        axis.set_title(
+            f"{QUERY_KIND_NAMES[query_kind]}: query-mean target attention by layer"
+        )
+        figure.colorbar(image, ax=axis, fraction=0.03, pad=0.02)
     figure.savefig(path, dpi=PLOT_DPI, bbox_inches="tight")
     plt.close(figure)
 
@@ -1361,6 +1409,10 @@ def main() -> None:
                     category_plot_rel = (
                         Path(PLOT_SUBDIR) / f"{stem}_category_attention.png"
                     )
+                    category_by_layer_plot_rel = (
+                        Path(PLOT_SUBDIR)
+                        / f"{stem}_category_attention_by_layer.png"
+                    )
                     plot_attention_heatmap(
                         data, tokenizer, QUERY_LATENT, output_path / latent_plot_rel
                     )
@@ -1369,6 +1421,9 @@ def main() -> None:
                     )
                     plot_category_attention(
                         data, tokenizer, output_path / category_plot_rel
+                    )
+                    plot_category_attention_by_layer(
+                        data, output_path / category_by_layer_plot_rel
                     )
 
                     request_id = f"hf-{sample_ordinal:06d}"
@@ -1442,6 +1497,11 @@ def main() -> None:
                             "category_attention": (
                                 str(category_plot_rel)
                                 if (output_path / category_plot_rel).exists()
+                                else None
+                            ),
+                            "category_attention_by_layer": (
+                                str(category_by_layer_plot_rel)
+                                if (output_path / category_by_layer_plot_rel).exists()
                                 else None
                             ),
                         },
