@@ -16,17 +16,17 @@ import json
 import shutil
 import sys
 import tempfile
-from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable
-import os
 import numpy as np
 from PIL import Image
 # Resolve the portable helper beside this script, including python -m usage.
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from hrbench_tsne_common import (
     sample_indices, save_features, run_tsne, validate_settings,
-    prepare_capture_directory,
+    prepare_capture_directory, json_compatible as _json_compatible,
+    SampleDeadline, SampleCaptureTimeout, validate_timeout_settings,
+    append_sample_progress, skipped_sample_record, write_empty_capture, check_timeout_budget,
 )
 
 
@@ -64,6 +64,9 @@ VOCAB_EMBEDDING_BATCH_SIZE = 8192
 
 # Keep temporary float16 captures only when an error occurs.
 KEEP_TEMP_CAPTURE_ON_ERROR = True
+# Cooperative deadline: checked between GPU decoding steps. None disables it.
+SAMPLE_TIMEOUT_SECONDS: float | None = 300.0
+MAX_SAMPLE_TIMEOUTS = 20
 
 
 # t-SNE and persistent original-feature configuration.
@@ -613,7 +616,7 @@ def run_inference(
     model_details: dict[str, Any],
 ) -> tuple[list[Path], list[dict[str, Any]], dict[str, Any]]:
     import torch
-    from transformers import LogitsProcessorList
+    from transformers import LogitsProcessorList, StoppingCriteriaList
 
     project_src = Path(__file__).resolve().parent / "src"
     if str(project_src) not in sys.path:
@@ -646,9 +649,15 @@ def run_inference(
     for sample_ordinal, (row, dataset_ordinal) in enumerate(
         zip(rows, selected_indices)
     ):
-        image = decode_hrbench_image(row["image"], dataset_dir)
+        deadline = SampleDeadline(SAMPLE_TIMEOUT_SECONDS)
+        image = None
+        inputs = prompt_ids = generated = full_ids = hidden_steps = None
+        image_capture = image_vectors = latent_vectors = output_ids = None
         request_id = f"hf-{sample_ordinal:06d}"
+        capture_path = capture_dir / f"capture_{sample_ordinal:06d}.npz"
         try:
+            image = decode_hrbench_image(row["image"], dataset_dir)
+            deadline.check()
             messages = [
                 {
                     "role": "user",
@@ -682,6 +691,7 @@ def run_inference(
                     f"Sample {sample_ordinal} contains no image tokens after processing."
                 )
 
+            deadline.check()
             with (
                 torch.inference_mode(),
                 ImageFeatureCapture(visual, hidden_size) as image_capture,
@@ -689,6 +699,7 @@ def run_inference(
                 generated = model.generate(
                     **inputs,
                     max_new_tokens=MAX_NEW_TOKENS,
+                    stopping_criteria=StoppingCriteriaList([deadline]),
                     temperature=TEMPERATURE,
                     top_p=TOP_P,
                     do_sample=TEMPERATURE > 0,
@@ -699,6 +710,7 @@ def run_inference(
                     output_hidden_states=True,
                 )
 
+            deadline.check()
             full_ids = generated.sequences[0]
             output_ids = (
                 full_ids[prompt_length:]
@@ -734,7 +746,7 @@ def run_inference(
             ).astype(np.int32, copy=False)
             image_vectors = image_capture.injected_features(len(image_positions))
 
-            capture_path = capture_dir / f"capture_{sample_ordinal:06d}.npz"
+            deadline.check()
             np.savez(
                 capture_path,
                 image_vectors=image_vectors.astype(np.float16, copy=False),
@@ -747,10 +759,6 @@ def run_inference(
                 latent_generation_steps=latent_steps,
                 latent_indices=latent_indices,
             )
-            capture_paths.append(capture_path)
-            per_sample_image_counts.append(int(len(image_vectors)))
-            per_sample_latent_counts.append(int(len(latent_vectors)))
-
             decoded = processor.batch_decode(
                 [output_ids.tolist()],
                 skip_special_tokens=False,
@@ -758,6 +766,8 @@ def run_inference(
             )[0]
             sample_records.append(
                 {
+                    "status": "ok",
+                    "elapsed_seconds": deadline.elapsed,
                     "sample_ordinal": sample_ordinal,
                     "dataset_ordinal": int(dataset_ordinal),
                     "dataset_index": _json_compatible(row["index"]),
@@ -784,18 +794,36 @@ def run_inference(
                     "latent_indices": latent_indices.tolist(),
                 }
             )
+            capture_paths.append(capture_path)
+            per_sample_image_counts.append(int(len(image_vectors)))
+            per_sample_latent_counts.append(int(len(latent_vectors)))
+            append_sample_progress(capture_dir, sample_records[-1])
             print(
                 f"[{sample_ordinal + 1}/{len(rows)}] "
                 f"dataset={dataset_ordinal}, image={len(image_vectors)}, "
                 f"latent={len(latent_vectors)}, output={len(output_ids)}"
             )
+        except SampleCaptureTimeout as exc:
+            write_empty_capture(capture_path, hidden_size, request_id)
+            capture_paths.append(capture_path)
+            per_sample_image_counts.append(0)
+            per_sample_latent_counts.append(0)
+            record = skipped_sample_record(row, sample_ordinal, dataset_ordinal, request_id, str(exc), deadline.elapsed)
+            sample_records.append(record)
+            append_sample_progress(capture_dir, record)
+            print(f"[Timeout: skipped] sample={sample_ordinal}, dataset={dataset_ordinal}: {exc}", flush=True)
+            check_timeout_budget(sample_records, MAX_SAMPLE_TIMEOUTS)
         finally:
-            image.close()
+            if image is not None:
+                image.close()
+            inputs = prompt_ids = generated = full_ids = hidden_steps = None
+            image_capture = image_vectors = latent_vectors = output_ids = None
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
 
-        del inputs, prompt_ids, generated, full_ids, hidden_steps
-        gc.collect()
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
+    if not any(record.get("status") == "ok" for record in sample_records):
+        raise RuntimeError("No samples completed successfully; refusing a vocabulary-only analysis.")
 
     return (
         capture_paths,
@@ -803,6 +831,7 @@ def run_inference(
         {
             "per_sample_image_counts": per_sample_image_counts,
             "per_sample_latent_counts": per_sample_latent_counts,
+            "timed_out_samples": sum(r.get("status") == "skipped_timeout" for r in sample_records),
         },
     )
 
@@ -952,6 +981,7 @@ def main() -> None:
         feature_dir = Path(FEATURE_CACHE_DIR).expanduser() if FEATURE_CACHE_DIR else output_path / "features"
         run_tsne(feature_dir, projection_path, options, expected_model='ILVR')
         return
+    validate_timeout_settings(SAMPLE_TIMEOUT_SECONDS, MAX_SAMPLE_TIMEOUTS)
     model_path, dataset_path, output_path = validate_configuration()
     prepare_capture_directory(output_path)
     rows, selected_indices = load_hrbench_rows(dataset_path)

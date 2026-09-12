@@ -20,6 +20,96 @@ KIND_NAMES = np.asarray(["vocabulary_embedding", "image_feature", "latent"])
 BLOCK_SIZE = 8192
 
 
+def json_compatible(value):
+    """Convert result fields, including nested NumPy values, before JSON export."""
+    if isinstance(value, np.generic):
+        return json_compatible(value.item())
+    if isinstance(value, np.ndarray):
+        return json_compatible(value.tolist())
+    if isinstance(value, Path):
+        return str(value)
+    if isinstance(value, dict):
+        return {str(key): json_compatible(item) for key, item in value.items()}
+    if isinstance(value, (tuple, list)):
+        return [json_compatible(item) for item in value]
+    return value
+
+
+class SampleCaptureTimeout(TimeoutError):
+    pass
+
+
+class SampleDeadline:
+    """Cooperative deadline, checked by HF after each decoding step.
+
+    Also callable as a Transformers stopping criterion. No torch dependency;
+    a bool broadcasts over the single-sample StoppingCriteriaList result.
+    A running CUDA/C call cannot be preempted by this deadline.
+    """
+    def __init__(self, seconds, clock=None):
+        self.clock = clock or time.monotonic
+        self.started = self.clock()
+        self.seconds = seconds
+
+    @property
+    def elapsed(self):
+        return self.clock() - self.started
+
+    def __call__(self, input_ids=None, scores=None, **kwargs):
+        return self.seconds is not None and self.elapsed >= self.seconds
+
+    def check(self):
+        if self():
+            raise SampleCaptureTimeout(f"Sample exceeded {self.seconds:g}s (elapsed {self.elapsed:.1f}s)")
+
+
+def validate_timeout_settings(seconds, maximum):
+    if seconds is not None and (not np.isfinite(seconds) or seconds <= 0):
+        raise ValueError("SAMPLE_TIMEOUT_SECONDS must be positive and finite, or None.")
+    if not isinstance(maximum, int) or maximum < 0:
+        raise ValueError("MAX_SAMPLE_TIMEOUTS must be a nonnegative integer.")
+
+
+def append_sample_progress(capture_dir, record):
+    with (Path(capture_dir).parent / "capture_progress.jsonl").open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(json_compatible(record), ensure_ascii=False) + "\n")
+
+
+def skipped_sample_record(row, sample_ordinal, dataset_ordinal, request_id, reason, elapsed):
+    return json_compatible({
+        "sample_ordinal": sample_ordinal, "dataset_ordinal": int(dataset_ordinal),
+        "dataset_index": row["index"], "request_id": request_id,
+        "question": row["question"], "answer": row["answer"], "category": row["category"],
+        "cycle_category": row["cycle_category"], "choices": {k: row[k] for k in "ABCD"},
+        "status": "skipped_timeout", "skip_reason": reason, "elapsed_seconds": elapsed,
+        "output_token_ids": [], "raw_output_text": "",
+        "capture_counts": {"image_feature": 0, "latent": 0},
+    })
+
+
+def write_empty_capture(path, hidden_size, request_id, monet=False):
+    """An empty row group preserves sample ordinals; never invent feature points."""
+    vectors = np.empty((0, hidden_size), dtype=np.float16)
+    positions = np.empty(0, dtype=np.int32)
+    if monet:
+        np.savez(path, vectors=vectors, kind_codes=np.empty(0, dtype=np.uint8),
+                 sequence_positions=positions, generation_steps=positions, latent_indices=positions,
+                 prompt_length=np.array(0), consumed_output_token_count=np.array(0),
+                 request_id=np.asarray(request_id))
+    else:
+        np.savez(path, image_vectors=vectors, latent_vectors=vectors,
+                 image_sequence_positions=positions, image_generation_steps=positions,
+                 latent_sequence_positions=positions, latent_generation_steps=positions, latent_indices=positions)
+
+
+def check_timeout_budget(records, maximum):
+    skipped = sum(r.get("status", "ok").startswith("skipped_") for r in records)
+    if skipped > maximum:
+        raise RuntimeError(f"Too many sample timeouts: {skipped} > MAX_SAMPLE_TIMEOUTS={maximum}. "
+                           "Stopping; captures and capture_progress.jsonl are preserved.")
+    return skipped
+
+
 def json_default(value):
     if isinstance(value, np.ndarray):
         return value.tolist()
@@ -144,6 +234,8 @@ def save_features(output_path, arrays, metadata, records, capture_config, statis
         dataset_indices=np.asarray([str(r["dataset_index"]) for r in records]),
         request_ids=np.asarray([str(r["request_id"]) for r in records]),
         dataset_ordinals=np.asarray([r["dataset_ordinal"] for r in records], dtype=np.int64),
+        sample_status=np.asarray([r.get("status", "ok") for r in records]),
+        sample_skip_reasons=np.asarray([r.get("skip_reason", "") for r in records]),
     )
     validate_features(arrays, metadata, statistics)
     feature_dir = output_path / "features"
