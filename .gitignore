@@ -1,0 +1,7 @@
+# Generated interaction-training artifacts and local verification dependencies.
+/.cache/
+/data/
+/checkpoints/
+/outputs/
+__pycache__/
+*.pyc

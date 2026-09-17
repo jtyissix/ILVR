@@ -1,0 +1,5 @@
+{
+  "mode": "baseline_ct",
+  "output_dir": "outputs/baseline_ct",
+  "deepspeed": "configs/interaction/zero2.json"
+}

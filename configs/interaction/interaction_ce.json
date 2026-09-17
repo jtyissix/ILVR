@@ -1,0 +1,10 @@
+{
+  "mode": "interaction_ce",
+  "output_dir": "outputs/interaction_ce",
+  "model_path": "checkpoints/ilvr_comt",
+  "reference_path": null,
+  "data_path": "data/comt/TRAIN.jsonl",
+  "image_root": "data/comt",
+  "prepared_dir": "data/comt/prepared",
+  "deepspeed": "configs/interaction/zero2.json"
+}

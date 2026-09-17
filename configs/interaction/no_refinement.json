@@ -1,0 +1,5 @@
+{
+  "mode": "no_refinement",
+  "output_dir": "outputs/no_refinement",
+  "deepspeed": "configs/interaction/zero2.json"
+}

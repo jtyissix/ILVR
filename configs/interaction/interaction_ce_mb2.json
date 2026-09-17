@@ -1,0 +1,6 @@
+{
+  "mode": "interaction_ce",
+  "micro_batch_size": 2,
+  "gradient_accumulation_steps": 1,
+  "output_dir": "outputs/interaction_mb2"
+}

@@ -373,10 +373,15 @@ def run_tsne(feature_dir, output_dir, options, expected_model=None):
                             explained_variance_ratio=pca.explained_variance_ratio_)
         params = dict(n_components=3, perplexity=options["perplexity"], init="pca", learning_rate="auto",
                       random_state=options["random_state"], metric="euclidean", method="barnes_hut",
-                      verbose=1, n_jobs=options["n_jobs"])
+                      verbose=2, n_jobs=options["n_jobs"])
         iteration_key = "max_iter" if "max_iter" in inspect.signature(TSNE).parameters else "n_iter"
         params[iteration_key] = options["max_iter"]
         estimator = TSNE(**params)
+        print(
+            f"Starting CPU 3D t-SNE on {total:,} points. Optimization progress is printed "
+            "every 50 iterations; the first update may take several minutes. "
+            "Use python -u for unbuffered server logs.", flush=True,
+        )
         coordinates = estimator.fit_transform(reduced).astype(np.float32, copy=False)
         if coordinates.shape != (total, 3) or not np.isfinite(coordinates).all():
             raise ValueError("t-SNE did not produce finite [N, 3] coordinates.")
