@@ -169,6 +169,7 @@ class EMMATest(unittest.TestCase):
         from transformers import AutoProcessor
         import torch
         row = sample()
+        second = sample(identity="Math_2")
         model = mock.MagicMock()
         model.eval.return_value = model.to.return_value = model
         model.config = SimpleNamespace(eos_token_id=90, latent_size=9, image_token_id=80, to_dict=lambda: {})
@@ -185,7 +186,7 @@ class EMMATest(unittest.TestCase):
             stack.enter_context(mock.patch("sys.argv", ["evaluate", "--task", "emma", "--model_path", "unused",
                                 "--test_data_path", "unused", "--image_root", str(root), "--output_dir", str(root / "out")]))
             stack.enter_context(mock.patch.dict("sys.modules", {"eval": None}))
-            stack.enter_context(mock.patch.object(emma, "load_samples", return_value=([row], {"prompt_strategy": "CoT"})))
+            stack.enter_context(mock.patch.object(emma, "load_samples", return_value=([row, second], {"prompt_strategy": "CoT"})))
             stack.enter_context(mock.patch.object(emma, "vision_inputs", return_value=[Image.new("RGB", (4, 4))] * 3))
             for name in ("set_device", "synchronize"):
                 stack.enter_context(mock.patch.object(evaluate.torch.cuda, name))
@@ -203,6 +204,28 @@ class EMMATest(unittest.TestCase):
             self.assertNotIn("true_false", results[row["pid"]])
             self.assertEqual(results[row["pid"]]["response"], r"\boxed{B}")
             self.assertIsNone(json.loads((root / "out/metrics.json").read_text())["accuracy"])
+            # Simulate interruption while writing the second answer.
+            rank_file = root / "out/predictions_rank0.jsonl"
+            first = rank_file.read_text().splitlines()[0]
+            rank_file.write_text(first + '\n{"index":1,"raw_output":"', encoding="utf-8")
+            # A null score is a completed EMMA generation. Resume must not rerun it.
+            with mock.patch("sys.argv", ["evaluate", "--task", "emma", "--model_path", "unused",
+                            "--test_data_path", "unused", "--image_root", str(root),
+                            "--output_dir", str(root / "out"), "--resume"]):
+                generate.reset_mock()
+                evaluate.main()
+                self.assertEqual(generate.call_count, 1)
+                regenerated = [json.loads(line) for line in rank_file.read_text().splitlines()]
+                self.assertEqual([r["index"] for r in regenerated], [0, 1])
+                self.assertEqual(json.loads(first), regenerated[0])
+                generate.reset_mock()
+                evaluate.main()
+                generate.assert_not_called()
+                status = json.loads((root / "out/progress_rank0.json").read_text())
+                self.assertEqual(status["stage"], "complete")
+                self.assertEqual(status["completed"], 2)
+            with self.assertRaisesRegex(ValueError, "Existing evaluation output"):
+                evaluate.main()
 
 
 if __name__ == "__main__":

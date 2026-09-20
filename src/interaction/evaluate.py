@@ -1,6 +1,7 @@
 """CoMT/VSP evaluation and EMMA response generation with continuous latents."""
 import argparse
 from collections import defaultdict
+from datetime import timedelta
 import json
 import os
 from pathlib import Path
@@ -9,6 +10,7 @@ import torch
 import torch.distributed as dist
 from .data import json_write, position_ids_for_images, resolve_image, token_ids, user_message, stable_hash
 from .distributed import rank, world
+from .evaluation_state import EvaluationProgress, check_resume_config, load_rank_records
 from .generation import generate_continuous
 from .model import input_embeddings, load_full_model
 from . import vsp, emma
@@ -39,6 +41,13 @@ def summarize(records):
             "token_limit_count": sum(r["hit_token_limit"] for r in records)}
 
 
+def init_evaluation_group(timeout_seconds):
+    if int(os.environ.get("WORLD_SIZE", "1")) > 1:
+        # GPUs generate independently; only completion needs coordination.
+        # Do not start a lazy NCCL communicator after ranks have drifted apart.
+        dist.init_process_group("gloo", timeout=timedelta(seconds=timeout_seconds))
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model_path", required=True)
@@ -52,11 +61,16 @@ def main():
     parser.add_argument("--max_input_tokens", type=int, default=32768,
                         help="EMMA input limit: fail with pid rather than truncate a multi-image question")
     parser.add_argument("--attention_backend", choices=["sdpa", "flash_attention_2"], default="flash_attention_2")
+    parser.add_argument("--resume", action="store_true", help="Append missing samples to an interrupted run with the same inputs and world size")
+    parser.add_argument("--sync_timeout_seconds", type=int, default=14400,
+                        help="CPU process-group timeout; default 4 hours allows uneven generation workloads")
+    parser.add_argument("--progress_interval_seconds", type=float, default=30,
+                        help="Report token-generation progress at this interval; does not impose a generation time limit")
     args = parser.parse_args()
     if args.max_new_tokens is None:
         args.max_new_tokens = 4096 if args.task == "emma" else 1024
-    if args.max_new_tokens <= 0 or args.max_input_tokens <= 0:
-        parser.error("Token limits must be positive")
+    if min(args.max_new_tokens, args.max_input_tokens, args.sync_timeout_seconds, args.progress_interval_seconds) <= 0:
+        parser.error("Token limits and time intervals must be positive")
     # Validate before allocating GPU model replicas; VSP never needs gold answer text.
     if args.task == "vsp":
         samples, data_report = vsp.load_samples(args.test_data_path, args.image_root)
@@ -70,8 +84,19 @@ def main():
         data_report = {"samples": len(samples)}
     local_rank = int(os.environ.get("LOCAL_RANK", "0"))
     torch.cuda.set_device(local_rank)
-    if int(os.environ.get("WORLD_SIZE", "1")) > 1:
-        dist.init_process_group("nccl")
+    init_evaluation_group(args.sync_timeout_seconds)
+    output = Path(args.output_dir)
+    if rank() == 0 and not args.resume and (list(output.glob("predictions*.jsonl")) or (output / "evaluation_config.json").exists()):
+        raise ValueError("Existing evaluation output: use --resume or choose a new output_dir; predictions were not overwritten")
+    if args.resume and not (output / "evaluation_config.json").is_file():
+        raise FileNotFoundError("--resume needs the original evaluation_config.json in output_dir")
+    if dist.is_initialized():
+        dist.barrier()  # Complete the fresh-output check before any worker writes.
+    output.mkdir(parents=True, exist_ok=True)
+    total = len(range(rank(), len(samples), world()))
+    progress = EvaluationProgress(output, rank(), local_rank, total)
+    progress.update("loading_model", coordination_backend="gloo" if world() > 1 else "none",
+                    sync_timeout_seconds=args.sync_timeout_seconds)
     device = torch.device("cuda", local_rank)
     model = load_full_model(args.model_path, args.attention_backend).eval().to(device)
     from transformers import AutoProcessor
@@ -83,25 +108,40 @@ def main():
     ids = token_ids(processor, model.config.to_dict())
     eos = model.config.eos_token_id
     eos = set(eos if isinstance(eos, list) else [eos])
-    output = Path(args.output_dir)
-    output.mkdir(parents=True, exist_ok=True)
     prompt_style = args.vsp_prompt_style if args.task == "vsp" else "ilvr_eval"
     if args.task == "emma":
         prompt_style = f"emma_official_{data_report['prompt_strategy']}"
-    if rank() == 0:
-        json_write(output / "evaluation_config.json", {**vars(args), "world_size": world(),
+    configuration = {**vars(args), "world_size": world(),
                    "latent_size": model.config.latent_size, "data": data_report,
                    "prompt_style": prompt_style, "do_sample": False,
                    "ilvr_prompt_source_revision": vsp.ILVR_PROMPT_REVISION if args.task != "emma" else None,
                    "emma_prompt_source_revision": emma.EMMA_REVISION if args.task == "emma" else None,
                    "scoring_status": "pending_offline_scoring" if args.task == "emma" else "inline",
-                   "vision_attention": sorted({type(block.attn).__name__ for block in model.visual.blocks})})
+                   "vision_attention": sorted({type(block.attn).__name__ for block in model.visual.blocks}),
+                   "coordination_backend": "gloo" if world() > 1 else "none"}
+    if args.resume:
+        previous = json.loads((output / "evaluation_config.json").read_text(encoding="utf-8"))
+        check_resume_config(previous, configuration)
+    if rank() == 0 and not args.resume:
+        json_write(output / "evaluation_config.json", configuration)
+    elif rank() == 0:
+        json_write(output / "resume_config.json", configuration)
     print(f"[rank {rank()}] evaluating {len(range(rank(), len(samples), world()))} samples; "
           f"prompt={prompt_style}, latent_size={model.config.latent_size}, decoding=greedy", flush=True)
     rank_file = output / f"predictions_rank{rank()}.jsonl"
-    with rank_file.open("w", encoding="utf-8") as handle:
+    existing = load_rank_records(rank_file, samples, args.task, rank(), world(), prompt_style,
+                                 model.config.latent_size, repair_tail=True) if args.resume else []
+    completed_indices = {row["index"] for row in existing}
+    completed = len(completed_indices)
+    progress.update("ready", completed=completed)
+    with rank_file.open("a" if args.resume else "w", encoding="utf-8") as handle:
         for index in range(rank(), len(samples), world()):
+            if index in completed_indices:
+                continue
             sample = samples[index]
+            sample_start = time.perf_counter()
+            progress.update("preprocessing", index=index, pid=sample.get("pid", sample.get("map_id", index)),
+                            generated_tokens=0, input_tokens=None, elapsed_seconds=0.0)
             if args.task == "vsp":
                 paths = vsp.image_paths(sample, args.image_root)
                 message = vsp.user_message(sample, paths, args.vsp_prompt_style)
@@ -144,14 +184,21 @@ def main():
                     "input_ids": batch["input_ids"][0].tolist(), "image_grid_thw": grids,
                 })
             positions = position_ids_for_images(batch["input_ids"][0].tolist(), grids, model.config.to_dict())[:, None].to(device)
+            preprocess_seconds = time.perf_counter() - sample_start
+            progress.update("vision", input_tokens=batch["input_ids"].shape[-1], images=len(pictures),
+                            preprocessing_seconds=round(preprocess_seconds, 3))
             with torch.no_grad():
+                vision_start = time.perf_counter()
                 features = model.visual(batch["pixel_values"].to(device=device, dtype=torch.bfloat16),
                                          grid_thw=batch["image_grid_thw"].to(device)) if pictures else None
                 embeds = input_embeddings(model.model, batch["input_ids"].to(device), features, model.config.image_token_id)
                 torch.cuda.synchronize()
+                vision_seconds = time.perf_counter() - vision_start
                 tick = time.perf_counter()
                 result = generate_continuous(model.model, model.lm_head, embeds, positions, ids, eos,
-                                             model.config.latent_size, args.max_new_tokens, args.attention_backend)
+                                             model.config.latent_size, args.max_new_tokens, args.attention_backend,
+                                             progress_callback=progress.update,
+                                             progress_interval_seconds=args.progress_interval_seconds)
                 torch.cuda.synchronize()
                 seconds = time.perf_counter()-tick
             raw = processor.tokenizer.decode(result["token_ids"], skip_special_tokens=False)
@@ -165,21 +212,26 @@ def main():
                 scored = {"category": task_category(sample), "prediction": prediction,
                           "gold": sample["original_final_answer"], "correct": correct}
             record = {"index": index, **scored, "raw_output": raw, "generation_seconds": seconds, **result,
+                      "preprocessing_seconds": preprocess_seconds, "vision_seconds": vision_seconds,
+                      "sample_seconds": time.perf_counter() - sample_start, "input_tokens": batch["input_ids"].shape[-1],
                       "prompt_style": prompt_style,
                       "prompt_input_sha256": stable_hash({"input_ids": batch["input_ids"][0].tolist(),
                                                           "image_grid_thw": grids})}
             handle.write(json.dumps(record, ensure_ascii=False) + "\n")
             handle.flush()
-            completed = (index - rank()) // world() + 1
+            completed += 1
+            progress.update("saved", completed=completed, generated_tokens=len(result["token_ids"]),
+                            elapsed_seconds=round(time.perf_counter() - sample_start, 1))
             print(f"[rank {rank()}] {completed}/{len(range(rank(), len(samples), world()))} "
                   f"index={index} correct={scored['correct']} generation={seconds:.1f}s", flush=True)
+    progress.update("waiting_for_other_ranks" if world() > 1 else "merging", completed=completed)
     if dist.is_initialized():
         dist.barrier()
     if rank() == 0:
         merged = []
         for worker in range(world()):
-            with (output / f"predictions_rank{worker}.jsonl").open(encoding="utf-8") as handle:
-                merged.extend(json.loads(line) for line in handle)
+            merged.extend(load_rank_records(output / f"predictions_rank{worker}.jsonl", samples, args.task,
+                                            worker, world(), prompt_style, model.config.latent_size))
         merged.sort(key=lambda r: r["index"])
         if [r["index"] for r in merged] != list(range(len(samples))):
             raise ValueError("Distributed evaluation lost or duplicated examples")
@@ -194,6 +246,7 @@ def main():
             metrics = vsp.summarize(merged) if args.task == "vsp" else summarize(merged)
         json_write(output / "metrics.json", metrics)
         print(json.dumps(metrics, ensure_ascii=False, indent=2))
+    progress.update("complete")
     if dist.is_initialized():
         dist.destroy_process_group()
 

@@ -117,7 +117,7 @@ torchrun --standalone --nproc_per_node=4 --module src.interaction.evaluate \
 
 单卡可把命令开头改为 `CUDA_VISIBLE_DEVICES=2 python -m src.interaction.evaluate`，其余参数不变。只设置四个 `CUDA_VISIBLE_DEVICES` 再运行普通 `python` 仍只启动一个进程。
 
-每次使用新的输出目录，避免覆盖前次结果。两个模型使用相同数据、策略、生成预算和评分方式。若想测试官方 Direct 策略，重新 prepare 到另一目录并传 `--strategy Direct`；不要混入 CoT 结果。
+新实验使用新的输出目录；中断后用原目录加 `--resume` 续跑，见第 8 节。入口会拒绝直接覆盖已有预测。两个模型使用相同数据、策略、生成预算和评分方式。若想测试官方 Direct 策略，重新 prepare 到另一目录并传 `--strategy Direct`；不要混入 CoT 结果。
 
 生成时每完成一题输出进度并刷新该 rank 的 JSONL。默认 `--max_input_tokens 32768`，超限带 pid 报错，不静默截掉选项或图片。输出：
 
@@ -218,3 +218,57 @@ python -m unittest tests.test_interaction_emma tests.test_interaction_vsp tests.
 ```
 
 本地未运行真实 CUDA 模型生成或 72B 裁判，也未测得模型在 EMMA 上的准确率；这两步需要在你的服务器按上面的命令执行。完整 2788 题的数据计数依据官方数据集元信息，逐题比对在 mini 上完成。
+
+## 8. 多卡完成不同步、超时与续跑
+
+旧版在评测结束时才调用 NCCL barrier，默认超时 600 秒。如果某卡已完成、其他卡仍在处理较慢题目，快卡可能等待超时；torchrun 随后终止其余进程。日志中的 `rank 2 ...100/100` 只代表该卡完成，不代表四卡都完成；`GPU ... currently unknown` 也不能单独证明 GPU 映射出错。[PyTorch 超时说明](https://docs.pytorch.org/docs/2.6/distributed.html#torch.distributed.init_process_group)
+
+新版仅用 **CPU Gloo** 协调各进程完成，模型计算仍在各自 GPU 上；默认等待上限 **4 小时**，通过 `--sync_timeout_seconds` 调整。没有降低 token 预算、跳题或更改 prompt/生成算法。若其他进程真实崩溃，仍需看它最早的异常，不把所有故障归结为同步。
+
+保留服务器原输出目录里的 `evaluation_config.json` 和 `predictions_rank*.jsonl`，不要拿 FinalShell 的部分本地快照覆盖服务器文件。上传新版 `evaluate.py`、`generation.py` 和新增的 `evaluation_state.py` 后，用**原启动命令、原模型、原数据、原卡数、原生成参数**加 `--resume`。例如原来使用本文四卡命令时：
+
+```bash
+CUDA_VISIBLE_DEVICES=2,3,5,7 \
+torchrun --standalone --nproc_per_node=4 \
+  --log-dir outputs/emma_resume_logs --tee 3 \
+  --module src.interaction.evaluate \
+  --task emma \
+  --model_path outputs/interaction_ce/inference_2 \
+  --test_data_path data/emma/prepared/TEST.jsonl \
+  --image_root data/emma/prepared \
+  --output_dir outputs/eval_emma_interaction \
+  --max_new_tokens 4096 --attention_backend flash_attention_2 \
+  --resume --sync_timeout_seconds 14400 --progress_interval_seconds 30
+```
+
+上述路径和 `max_new_tokens` 必须与中断运行一致；若你原来显式设置了其他 `max_input_tokens`，也一并保留。不要更换模型目录内的权重或编辑 TEST 后再续跑。续跑检查数据报告、模型路径、生成配置及每条结果的样本身份；旧版没有权重内容指纹，无法识别同一路径被偷偷替换权重的情况。
+
+完整写入的回答直接跳过，包括 `correct=null` 和达到 token 上限的回答。只补做缺失样本；若最后一行被中断写坏，先备份到 `*.partial-*` 再恢复，文件中间损坏或重复样本则报错。续跑完成后重新合并并校验全部题目。`resume_config.json` 记录本次续跑设置，原 `evaluation_config.json` 保留。
+
+每卡新增 `progress_rankN.json`，并输出以下阶段：
+
+| stage | 含义和排查方向 |
+| --- | --- |
+| `preprocessing` | 读取/缩放图片、tokenization；长时间停留需查图片和磁盘 IO |
+| `vision` | 图像传入 GPU、视觉编码与 embedding；结合 GPU 利用率和本卡异常日志判断 |
+| `prefill` | 处理完整输入 prompt；图片 token 多时可能更慢 |
+| `decoding` | 自回归生成；循环每约 30 秒记录 `generated_tokens` 和耗时，数值增长表示仍在推进 |
+| `saved` | 一题回答已写入并刷新到 JSONL |
+| `waiting_for_other_ranks` | 本卡已完成，等待其他卡 |
+| `complete` | 本卡已结束；rank 0 也已完成合并 |
+
+如果 GPU 调用或 IO 本身阻塞，进度不会按 30 秒强行更新，最后一个阶段就是排查起点。新结果还记录 `preprocessing_seconds`、`vision_seconds`、`sample_seconds`、`input_tokens`；旧 `generation_seconds` 本来就不包含图片处理和视觉编码时间。
+
+检查 rank 3：
+
+```bash
+cat outputs/eval_emma_interaction/progress_rank3.json
+wc -l outputs/eval_emma_interaction/predictions_rank*.jsonl
+nvidia-smi
+```
+
+`CUDA_VISIBLE_DEVICES=2,3,5,7` 时，local rank 3 对应物理 GPU 7。结合 `--tee 3` 保存的各进程日志，找 rank 3 自己**最早的 Traceback**，不要只看最后的 `ChildFailedError`。
+
+如果四个 rank 文件其实已包含完整 400 题，合并阶段失败也不必重跑生成：第 4/5 节评分命令可直接使用 `--predictions outputs/eval_emma_interaction/predictions_rank*.jsonl`。评分入口会检查覆盖范围和重复题；文件不完整时先续跑，不用 `--allow_partial` 冒充完整集结果。
+
+本次修复通过 27 项 CPU 测试，包括中断续跑、已完成题不重复生成和进度回调不改变 8/9 步生成结果；另用真实两进程 Gloo，让第二个进程晚 2 秒完成，验证等待和合并。Linux 四卡 CUDA 场景仍需服务器复测。
