@@ -308,6 +308,7 @@ torchrun --standalone --nproc_per_node=2 --module tests.test_interaction_deepspe
 
 ## 9. 实现入口与来源
 
+- EMMA 测试：[EMMA 数据准备与评测指南](emma_evaluation_zh.md)，支持官方 mini/完整集、多图输入和独立判分。
 - 数据：`src/interaction/data.py`；训练：`src/interaction/train.py`。
 - 模型与效率实现：`model.py`、`fusion.py`、`execution.py`。
 - 分布式与恢复：`distributed.py`、`checkpoint.py`。

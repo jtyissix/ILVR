@@ -2,6 +2,8 @@
 
 **Interaction-CE continuation (new):** See [中文训练与数据准备指南](docs/interaction_training_zh.md) for frozen online reference, round-trip fusion, DeepSpeed ZeRO-2/3, checkpoint resume, inference export, and the three controlled CoMT experiments. Start with `bash run_interaction_training.sh configs/interaction/interaction_ce.json` after preparing the data and checkpoint.
 
+**EMMA evaluation:** See [EMMA 数据准备与评测指南](docs/emma_evaluation_zh.md) for official mini/full test data, multi-image prompts, distributed response generation, and official fast or local Qwen2.5-VL-72B scoring.
+
 [![arXiv](https://img.shields.io/badge/arXiv-2512.05665-b31b1b.svg)](https://arxiv.org/abs/2512.05665)
 [![ACL 2026](https://img.shields.io/badge/ACL%202026-Accepted-success)]()
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](https://opensource.org/licenses/MIT)

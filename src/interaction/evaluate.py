@@ -1,4 +1,4 @@
-"""CoMT exact-match and VSP spatial-planning evaluation with continuous latents."""
+"""CoMT/VSP evaluation and EMMA response generation with continuous latents."""
 import argparse
 from collections import defaultdict
 import json
@@ -11,7 +11,7 @@ from .data import json_write, position_ids_for_images, resolve_image, token_ids,
 from .distributed import rank, world
 from .generation import generate_continuous
 from .model import input_embeddings, load_full_model
-from . import vsp
+from . import vsp, emma
 
 
 def task_category(sample):
@@ -45,17 +45,23 @@ def main():
     parser.add_argument("--test_data_path", required=True)
     parser.add_argument("--image_root", required=True)
     parser.add_argument("--output_dir", required=True)
-    parser.add_argument("--task", choices=["comt", "vsp"], default="comt")
+    parser.add_argument("--task", choices=["comt", "vsp", "emma"], default="comt")
     parser.add_argument("--vsp_prompt_style", choices=vsp.PROMPT_STYLES, default="ilvr_eval",
                         help="VSP prompt only: ilvr_eval matches official eval.py; mirage_marker reproduces the previous layout")
-    parser.add_argument("--max_new_tokens", type=int, default=1024)
+    parser.add_argument("--max_new_tokens", type=int, default=None, help="Default: EMMA 4096, CoMT/VSP 1024")
+    parser.add_argument("--max_input_tokens", type=int, default=32768,
+                        help="EMMA input limit: fail with pid rather than truncate a multi-image question")
     parser.add_argument("--attention_backend", choices=["sdpa", "flash_attention_2"], default="flash_attention_2")
     args = parser.parse_args()
-    if args.max_new_tokens <= 0:
-        parser.error("--max_new_tokens must be positive")
+    if args.max_new_tokens is None:
+        args.max_new_tokens = 4096 if args.task == "emma" else 1024
+    if args.max_new_tokens <= 0 or args.max_input_tokens <= 0:
+        parser.error("Token limits must be positive")
     # Validate before allocating GPU model replicas; VSP never needs gold answer text.
     if args.task == "vsp":
         samples, data_report = vsp.load_samples(args.test_data_path, args.image_root)
+    elif args.task == "emma":
+        samples, data_report = emma.load_samples(args.test_data_path, args.image_root)
     else:
         with Path(args.test_data_path).open(encoding="utf-8") as handle:
             samples = [json.loads(line) for line in handle if line.strip()]
@@ -80,11 +86,15 @@ def main():
     output = Path(args.output_dir)
     output.mkdir(parents=True, exist_ok=True)
     prompt_style = args.vsp_prompt_style if args.task == "vsp" else "ilvr_eval"
+    if args.task == "emma":
+        prompt_style = f"emma_official_{data_report['prompt_strategy']}"
     if rank() == 0:
         json_write(output / "evaluation_config.json", {**vars(args), "world_size": world(),
                    "latent_size": model.config.latent_size, "data": data_report,
                    "prompt_style": prompt_style, "do_sample": False,
-                   "ilvr_prompt_source_revision": vsp.ILVR_PROMPT_REVISION,
+                   "ilvr_prompt_source_revision": vsp.ILVR_PROMPT_REVISION if args.task != "emma" else None,
+                   "emma_prompt_source_revision": emma.EMMA_REVISION if args.task == "emma" else None,
+                   "scoring_status": "pending_offline_scoring" if args.task == "emma" else "inline",
                    "vision_attention": sorted({type(block.attn).__name__ for block in model.visual.blocks})})
     print(f"[rank {rank()}] evaluating {len(range(rank(), len(samples), world()))} samples; "
           f"prompt={prompt_style}, latent_size={model.config.latent_size}, decoding=greedy", flush=True)
@@ -95,24 +105,41 @@ def main():
             if args.task == "vsp":
                 paths = vsp.image_paths(sample, args.image_root)
                 message = vsp.user_message(sample, paths, args.vsp_prompt_style)
+            elif args.task == "emma":
+                paths = emma.image_paths(sample, args.image_root)
+                message = emma.user_message(sample, paths)
             else:
                 paths = sample.get("image_input", [])
                 paths = [paths] if isinstance(paths, str) else paths
                 paths = [str(resolve_image(args.image_root, p)) for p in paths]
                 message = user_message(sample, paths)
-            pictures = []
-            for path in paths:
-                with Image.open(path) as image:
-                    pictures.append(image.convert("RGB"))
-            text = processor.apply_chat_template([message], tokenize=False, add_generation_prompt=True)
+            if args.task == "emma":
+                # Official EMMA Qwen wrapper resizes images with qwen_vl_utils
+                # before passing them to the checkpoint's own processor.
+                pictures = emma.vision_inputs(message)
+            else:
+                pictures = []
+                for path in paths:
+                    with Image.open(path) as image:
+                        pictures.append(image.convert("RGB"))
+            template_options = {"add_vision_id": True} if args.task == "emma" else {}
+            text = processor.apply_chat_template([message], tokenize=False, add_generation_prompt=True, **template_options)
             batch = processor(text=[text], images=pictures or None, return_tensors="pt", padding=True)
             grids = batch["image_grid_thw"].tolist() if pictures else []
-            if args.task == "vsp" and index == rank():
+            if args.task == "emma" and batch["input_ids"].shape[-1] > args.max_input_tokens:
+                raise ValueError(f"EMMA {sample['pid']}: {batch['input_ids'].shape[-1]} input tokens exceed "
+                                 f"--max_input_tokens {args.max_input_tokens}; question was not truncated")
+            if args.task == "emma":
+                print(f"[rank {rank()}] generating index={index} pid={sample['pid']} "
+                      f"images={len(pictures)} input_tokens={batch['input_ids'].shape[-1]}", flush=True)
+            if args.task in ("vsp", "emma") and index == rank():
                 # Capture the actual template output and expanded token IDs, not a
                 # separately reconstructed prompt. One small diagnostic file/rank.
                 json_write(output / f"prompt_rank{rank()}.json", {
-                    "index": index, "map_id": sample["map_id"], "prompt_style": prompt_style,
-                    "ilvr_prompt_source_revision": vsp.ILVR_PROMPT_REVISION,
+                    "index": index, "sample_id": sample.get("pid", sample.get("map_id")), "prompt_style": prompt_style,
+                    **({"map_id": sample.get("map_id"), "ilvr_prompt_source_revision": vsp.ILVR_PROMPT_REVISION}
+                       if args.task == "vsp" else {"pid": sample["pid"]}),
+                    "source_revision": emma.EMMA_REVISION if args.task == "emma" else vsp.ILVR_PROMPT_REVISION,
                     "image_paths": paths, "messages": [message], "rendered_prompt": text,
                     "input_ids": batch["input_ids"][0].tolist(), "image_grid_thw": grids,
                 })
@@ -130,6 +157,8 @@ def main():
             raw = processor.tokenizer.decode(result["token_ids"], skip_special_tokens=False)
             if args.task == "vsp":
                 scored = vsp.score(sample, raw)
+            elif args.task == "emma":
+                scored = emma.pending_record(sample, raw)
             else:
                 prediction = extract_final_answer(raw)
                 correct = normalize_for_match(prediction) == normalize_for_match(str(sample["original_final_answer"]))
@@ -157,7 +186,12 @@ def main():
         with (output / "predictions.jsonl").open("w", encoding="utf-8") as handle:
             for record in merged:
                 handle.write(json.dumps(record, ensure_ascii=False) + "\n")
-        metrics = vsp.summarize(merged) if args.task == "vsp" else summarize(merged)
+        if args.task == "emma":
+            metrics = {**emma.summarize(merged), "scoring": "pending_offline_scoring", "data": data_report,
+                       "ilvr_exact_reproduction": False}
+            json_write(output / "emma_responses.json", emma.official_results(samples, merged))
+        else:
+            metrics = vsp.summarize(merged) if args.task == "vsp" else summarize(merged)
         json_write(output / "metrics.json", metrics)
         print(json.dumps(metrics, ensure_ascii=False, indent=2))
     if dist.is_initialized():
