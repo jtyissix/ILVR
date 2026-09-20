@@ -3,6 +3,7 @@
 Run after installing requirements-interaction.txt (no checkpoint download needed).
 """
 import copy
+import json
 from pathlib import Path
 import tempfile
 import unittest
@@ -75,6 +76,24 @@ class QwenIntegrationTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as root:
             model.save_pretrained(root, safe_serialization=True)
             loaded = load_full_model(root, "sdpa", dtype=torch.float32)
+            for key, value in model.state_dict().items():
+                torch.testing.assert_close(value, loaded.state_dict()[key], rtol=0, atol=0)
+
+    def test_loading_old_export_resets_attention_backend_flags(self):
+        model = tiny_qwen()
+        with tempfile.TemporaryDirectory() as root:
+            model.save_pretrained(root, safe_serialization=True)
+            path = Path(root) / "config.json"
+            config = json.loads(path.read_text(encoding="utf-8"))
+            config["_attn_implementation_autoset"] = True
+            config["vision_config"]["_attn_implementation_autoset"] = True
+            path.write_text(json.dumps(config), encoding="utf-8")
+            original = path.read_bytes()
+            # Switching SDPA -> eager makes failed propagation observable on CPU.
+            loaded = load_full_model(root, "eager", dtype=torch.float32)
+            self.assertEqual(type(loaded.visual.blocks[0].attn).__name__, "Qwen2_5_VLVisionAttention")
+            self.assertEqual(loaded.config.vision_config._attn_implementation, "eager")
+            self.assertEqual(path.read_bytes(), original)  # Existing checkpoint is never rewritten.
             for key, value in model.state_dict().items():
                 torch.testing.assert_close(value, loaded.state_dict()[key], rtol=0, atol=0)
 

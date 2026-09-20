@@ -219,6 +219,9 @@ python -m src.interaction.export \
 
 ## 6. 初始和最终评测
 
+VSP 空间规划测试已接入同一入口，通过 `--task vsp` 启用；下载、放置、预检和单卡/四卡命令见
+[VSP 测试准备与评测](vsp_evaluation_zh.md)。以下 CoMT 命令保持不变。
+
 不使用 TEST 训练或选择学习率。预先固定 max_new_tokens 和评分规则后，评测初始 checkpoint 与各实验的最终模型：
 
 ```bash

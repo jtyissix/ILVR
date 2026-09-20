@@ -89,13 +89,22 @@ def assert_local_transformers():
 
 def load_full_model(path, backend, dtype=torch.bfloat16):
     assert_local_transformers()
-    from transformers import Qwen2_5_VLForConditionalGeneration
+    from transformers import Qwen2_5_VLConfig, Qwen2_5_VLForConditionalGeneration
+    config = Qwen2_5_VLConfig.from_pretrained(path, local_files_only=True)
+    # Older interaction exports persisted this runtime flag, skipping propagation
+    # of the requested backend into vision_config and silently selecting SDPA.
+    config._attn_implementation_autoset = False
+    config.vision_config._attn_implementation_autoset = False
     model, info = Qwen2_5_VLForConditionalGeneration.from_pretrained(
-        path, local_files_only=True, torch_dtype=dtype, attn_implementation=backend,
+        path, config=config, local_files_only=True, torch_dtype=dtype, attn_implementation=backend,
         low_cpu_mem_usage=True, output_loading_info=True,
     )
     if info.get("missing_keys") or info.get("mismatched_keys") or info.get("unexpected_keys"):
         raise ValueError(f"Checkpoint does not load exactly: {info}")
+    expected = {"flash_attention_2": "Qwen2_5_VLVisionFlashAttention2",
+                "sdpa": "Qwen2_5_VLVisionSdpaAttention", "eager": "Qwen2_5_VLVisionAttention"}[backend]
+    if any(type(block.attn).__name__ != expected for block in model.visual.blocks):
+        raise RuntimeError(f"Visual attention backend does not match requested {backend}")
     return model
 
 
