@@ -71,7 +71,7 @@ class VSPTest(unittest.TestCase):
             samples, report = vsp.load_samples(path, root, expected_samples=1)
             self.assertEqual(report["by_grid_size"], {"3x3": 1})
             paths = vsp.image_paths(samples[0], root)
-            message = vsp.user_message(samples[0], paths)
+            message = vsp.user_message(samples[0], paths, "mirage_marker")
             self.assertEqual([x["type"] for x in message["content"]], ["text", "image", "text"])
             prompt = json.dumps(message)
             for forbidden in ("map_desc", "SECRET ANSWER", "missing_helper", "<image>"):
@@ -80,6 +80,21 @@ class VSPTest(unittest.TestCase):
             self.assertEqual(Path(paths[0]), (root / "imgs_test/level3/img/0.png").resolve())
             rows[0]["image_input"] = "imgs_test/level3/img/0.png"
             self.assertEqual(vsp.image_paths(rows[0], root), paths)
+
+    def test_ilvr_default_keeps_image_first_and_question_verbatim(self):
+        sample = self.sample()
+        sample["text_input"] = "\n" + sample["text_input"] + "\n "
+        message = vsp.user_message(sample, ["input.png"])
+        # Official eval.py does not replace or strip the literal <image> text.
+        self.assertEqual(message, {"role": "user", "content": [
+            {"type": "image"}, {"type": "text", "text": sample["text_input"]}]})
+        self.assertIn("<image>", message["content"][1]["text"])
+        for style in vsp.PROMPT_STYLES:
+            rendered = json.dumps(vsp.user_message(sample, ["input.png"], style))
+            for forbidden in ("map_desc", "SECRET ANSWER", "missing_helper"):
+                self.assertNotIn(forbidden, rendered)
+        with self.assertRaisesRegex(ValueError, "Unknown VSP prompt style"):
+            vsp.user_message(sample, ["input.png"], "unknown")
 
     def test_preflight_reports_missing_images_duplicate_ids_and_bad_counts(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -112,6 +127,7 @@ class VSPTest(unittest.TestCase):
         from contextlib import ExitStack
         from src.interaction import evaluate
         from transformers import AutoProcessor
+        import torch
 
         model = mock.MagicMock()
         model.eval.return_value = model
@@ -120,6 +136,8 @@ class VSPTest(unittest.TestCase):
         model.visual.blocks = []
         processor = mock.MagicMock()
         processor.return_value = {key: mock.MagicMock() for key in ("input_ids", "pixel_values", "image_grid_thw")}
+        processor.return_value.update(input_ids=torch.tensor([[1, 80, 2]]), image_grid_thw=torch.tensor([[1, 2, 2]]))
+        processor.apply_chat_template.return_value = "rendered prompt including <image>"
         processor.tokenizer.decode.return_value = r"\boxed{DLLU}"
         generation = {"token_ids": [1], "segment_steps": [9], "hit_token_limit": False}
         with tempfile.TemporaryDirectory() as directory, ExitStack() as stack:
@@ -145,8 +163,28 @@ class VSPTest(unittest.TestCase):
             records = [json.loads(line) for line in (output / "predictions.jsonl").read_text(encoding="utf-8").splitlines()]
             self.assertEqual([r["index"] for r in records], [0, 1])
             self.assertTrue(all(r["segment_steps"] == [9] for r in records))
+            self.assertTrue(all(r["prompt_style"] == "ilvr_eval" for r in records))
+            config = json.loads((output / "evaluation_config.json").read_text(encoding="utf-8"))
+            self.assertEqual(config["prompt_style"], "ilvr_eval")
+            self.assertFalse(config["do_sample"])
+            prompt = json.loads((output / "prompt_rank0.json").read_text(encoding="utf-8"))
+            self.assertEqual(prompt["input_ids"], [1, 80, 2])
+            self.assertEqual(prompt["rendered_prompt"], "rendered prompt including <image>")
+            self.assertEqual([c["type"] for c in prompt["messages"][0]["content"]], ["image", "text"])
+            self.assertNotIn("SECRET ANSWER", json.dumps(prompt))
             for call in processor.apply_chat_template.call_args_list:
                 self.assertNotIn("SECRET ANSWER", str(call))
+                self.assertTrue(call.kwargs["add_generation_prompt"])
+            self.assertTrue(all(call.kwargs["padding"] for call in processor.call_args_list))
+
+            # Explicit legacy layout is passed through the real CLI to the builder.
+            with mock.patch("sys.argv", ["evaluate", "--task", "vsp", "--model_path", "unused",
+                            "--test_data_path", str(path), "--image_root", str(root),
+                            "--output_dir", str(root / "legacy"), "--vsp_prompt_style", "mirage_marker"]):
+                evaluate.main()
+            legacy = json.loads((root / "legacy" / "prompt_rank0.json").read_text(encoding="utf-8"))
+            self.assertEqual(legacy["prompt_style"], "mirage_marker")
+            self.assertEqual([c["type"] for c in legacy["messages"][0]["content"]], ["text", "image", "text"])
 
 
 if __name__ == "__main__":

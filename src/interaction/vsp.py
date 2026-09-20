@@ -10,6 +10,8 @@ from .data import file_hash, resolve_image
 
 MIRAGE_REVISION = "53f26de2682025e146781c5b198ec93bdfe4c4d6"
 TEST_ARCHIVE_SHA256 = "0272164f29dbed8b191977f7fa71cff8964b701bb84af293bf7525ada8394956"
+ILVR_PROMPT_REVISION = "13a67ed2ee975d6ca56b4e9eba18d68b352b166b"
+PROMPT_STYLES = ("ilvr_eval", "mirage_marker")
 ACTIONS = {"U": (-1, 0), "D": (1, 0), "L": (0, -1), "R": (0, 1)}
 WORDS = {"UP": "U", "DOWN": "D", "LEFT": "L", "RIGHT": "R"}
 
@@ -47,13 +49,23 @@ def image_paths(sample, image_root):
     return [str(resolve_image(image_root, value))]
 
 
-def user_message(sample, paths):
-    """Place the input image at the official <image> marker; never expose map_desc."""
+def user_message(sample, paths, prompt_style="ilvr_eval"):
+    """ILVR eval.py: image first, then UNMODIFIED text_input (including <image>).
+
+    mirage_marker preserves the earlier evaluator's image-in-text layout for
+    controlled comparisons. Neither mode exposes map_desc or helper images.
+    """
     text = sample["text_input"]
     if not isinstance(text, str) or not text.strip():
         raise ValueError("text_input must be a nonempty string")
     if len(paths) != 1 or text.count("<image>") > 1:
         raise ValueError("VSP expects one image and at most one <image> marker")
+    if prompt_style not in PROMPT_STYLES:
+        raise ValueError(f"Unknown VSP prompt style: {prompt_style}")
+    if prompt_style == "ilvr_eval":
+        # Deliberately identical to official run_one_example's message content.
+        # PIL images are passed separately to processor; <image> remains text.
+        return {"role": "user", "content": [{"type": "image"}, {"type": "text", "text": text}]}
     picture = {"type": "image", "image": paths[0]}
     if "<image>" in text:
         before, after = text.split("<image>")

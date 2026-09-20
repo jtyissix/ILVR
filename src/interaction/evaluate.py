@@ -7,7 +7,7 @@ from pathlib import Path
 import time
 import torch
 import torch.distributed as dist
-from .data import json_write, position_ids_for_images, resolve_image, token_ids, user_message
+from .data import json_write, position_ids_for_images, resolve_image, token_ids, user_message, stable_hash
 from .distributed import rank, world
 from .generation import generate_continuous
 from .model import input_embeddings, load_full_model
@@ -46,6 +46,8 @@ def main():
     parser.add_argument("--image_root", required=True)
     parser.add_argument("--output_dir", required=True)
     parser.add_argument("--task", choices=["comt", "vsp"], default="comt")
+    parser.add_argument("--vsp_prompt_style", choices=vsp.PROMPT_STYLES, default="ilvr_eval",
+                        help="VSP prompt only: ilvr_eval matches official eval.py; mirage_marker reproduces the previous layout")
     parser.add_argument("--max_new_tokens", type=int, default=1024)
     parser.add_argument("--attention_backend", choices=["sdpa", "flash_attention_2"], default="flash_attention_2")
     args = parser.parse_args()
@@ -77,17 +79,22 @@ def main():
     eos = set(eos if isinstance(eos, list) else [eos])
     output = Path(args.output_dir)
     output.mkdir(parents=True, exist_ok=True)
+    prompt_style = args.vsp_prompt_style if args.task == "vsp" else "ilvr_eval"
     if rank() == 0:
         json_write(output / "evaluation_config.json", {**vars(args), "world_size": world(),
                    "latent_size": model.config.latent_size, "data": data_report,
+                   "prompt_style": prompt_style, "do_sample": False,
+                   "ilvr_prompt_source_revision": vsp.ILVR_PROMPT_REVISION,
                    "vision_attention": sorted({type(block.attn).__name__ for block in model.visual.blocks})})
+    print(f"[rank {rank()}] evaluating {len(range(rank(), len(samples), world()))} samples; "
+          f"prompt={prompt_style}, latent_size={model.config.latent_size}, decoding=greedy", flush=True)
     rank_file = output / f"predictions_rank{rank()}.jsonl"
     with rank_file.open("w", encoding="utf-8") as handle:
         for index in range(rank(), len(samples), world()):
             sample = samples[index]
             if args.task == "vsp":
                 paths = vsp.image_paths(sample, args.image_root)
-                message = vsp.user_message(sample, paths)
+                message = vsp.user_message(sample, paths, args.vsp_prompt_style)
             else:
                 paths = sample.get("image_input", [])
                 paths = [paths] if isinstance(paths, str) else paths
@@ -98,8 +105,17 @@ def main():
                 with Image.open(path) as image:
                     pictures.append(image.convert("RGB"))
             text = processor.apply_chat_template([message], tokenize=False, add_generation_prompt=True)
-            batch = processor(text=[text], images=pictures or None, return_tensors="pt")
+            batch = processor(text=[text], images=pictures or None, return_tensors="pt", padding=True)
             grids = batch["image_grid_thw"].tolist() if pictures else []
+            if args.task == "vsp" and index == rank():
+                # Capture the actual template output and expanded token IDs, not a
+                # separately reconstructed prompt. One small diagnostic file/rank.
+                json_write(output / f"prompt_rank{rank()}.json", {
+                    "index": index, "map_id": sample["map_id"], "prompt_style": prompt_style,
+                    "ilvr_prompt_source_revision": vsp.ILVR_PROMPT_REVISION,
+                    "image_paths": paths, "messages": [message], "rendered_prompt": text,
+                    "input_ids": batch["input_ids"][0].tolist(), "image_grid_thw": grids,
+                })
             positions = position_ids_for_images(batch["input_ids"][0].tolist(), grids, model.config.to_dict())[:, None].to(device)
             with torch.no_grad():
                 features = model.visual(batch["pixel_values"].to(device=device, dtype=torch.bfloat16),
@@ -119,9 +135,15 @@ def main():
                 correct = normalize_for_match(prediction) == normalize_for_match(str(sample["original_final_answer"]))
                 scored = {"category": task_category(sample), "prediction": prediction,
                           "gold": sample["original_final_answer"], "correct": correct}
-            record = {"index": index, **scored, "raw_output": raw, "generation_seconds": seconds, **result}
+            record = {"index": index, **scored, "raw_output": raw, "generation_seconds": seconds, **result,
+                      "prompt_style": prompt_style,
+                      "prompt_input_sha256": stable_hash({"input_ids": batch["input_ids"][0].tolist(),
+                                                          "image_grid_thw": grids})}
             handle.write(json.dumps(record, ensure_ascii=False) + "\n")
             handle.flush()
+            completed = (index - rank()) // world() + 1
+            print(f"[rank {rank()}] {completed}/{len(range(rank(), len(samples), world()))} "
+                  f"index={index} correct={scored['correct']} generation={seconds:.1f}s", flush=True)
     if dist.is_initialized():
         dist.barrier()
     if rank() == 0:
