@@ -3,5 +3,6 @@
 /data/
 /checkpoints/
 /outputs/
+/configs/deepseek_api.json
 __pycache__/
 *.pyc

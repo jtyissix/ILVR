@@ -22,9 +22,10 @@
 | 生成 | 沿用本项目连续 latent 执行器；greedy；默认最多 4096 个生成位置，包含连续 latent 位置 |
 | latent 步数 | 读取模型 `config.json`，baseline 通常 8，Interaction 通常 9；不因换数据集而修改 |
 | 正式评分路径 | 官方 EMMA 裁判 prompt + 本地 Qwen2.5-VL-72B-Instruct；对所有题判分，属于公开 EMMA LLM 评分方式。ILVR 未公布选择题的具体评分分工 |
+| DeepSeek 宽松评分 | 官方 DeepSeek-V4.1-Flash API；答案等效或在 response 任意位置明确提到标准答案即判对。属于额外实验指标，不是官方 EMMA 规则 |
 | 快速评分路径 | 直接导入固定版本的官方 `fast_extract_answer` / `is_equal`，用于无裁判时检查结果；与 LLM 分数分开保存 |
 
-不把 `answer`、`solution` 加入待测模型的输入。准备好的 JSONL 保留金标准供**生成之后**评分，`solution` 不导出。裁判只接收官方模板要求的回答和金标准，不额外修改题意或推理评分标准。
+不把 `answer`、`solution` 加入待测模型的输入。准备好的 JSONL 保留金标准供**生成之后**评分，`solution` 不导出。Qwen 正式裁判接收官方模板要求的回答和金标准；DeepSeek 宽松评分还接收文字题面、选项和正确选项内容，其策略在第 5 节单独记录。
 
 ## 2. 下载与转换数据
 
@@ -117,7 +118,7 @@ torchrun --standalone --nproc_per_node=4 --module src.interaction.evaluate \
 
 单卡可把命令开头改为 `CUDA_VISIBLE_DEVICES=2 python -m src.interaction.evaluate`，其余参数不变。只设置四个 `CUDA_VISIBLE_DEVICES` 再运行普通 `python` 仍只启动一个进程。
 
-新实验使用新的输出目录；中断后用原目录加 `--resume` 续跑，见第 8 节。入口会拒绝直接覆盖已有预测。两个模型使用相同数据、策略、生成预算和评分方式。若想测试官方 Direct 策略，重新 prepare 到另一目录并传 `--strategy Direct`；不要混入 CoT 结果。
+新实验使用新的输出目录；中断后用原目录加 `--resume` 续跑，见第 9 节。入口会拒绝直接覆盖已有预测。两个模型使用相同数据、策略、生成预算和评分方式。若想测试官方 Direct 策略，重新 prepare 到另一目录并传 `--strategy Direct`；不要混入 CoT 结果。
 
 生成时每完成一题输出进度并刷新该 rank 的 JSONL。默认 `--max_input_tokens 32768`，超限带 pid 报错，不静默截掉选项或图片。输出：
 
@@ -176,7 +177,75 @@ python -m src.interaction.score_emma \
 
 若只有各卡的文件，也可把 `--predictions` 改为 `outputs/eval_emma_interaction/predictions_rank*.jsonl`；不要同时传合并文件和 rank 文件，以免重复。默认必须覆盖整个 test；`--allow_partial` 仅供诊断，并在 metrics 中标为覆盖不完整。
 
-## 5. 暂时没有 72B 裁判：先跑官方快速规则
+## 5. 用 DeepSeek-V4.1-Flash API 按宽松规则评分
+
+这是一条额外评分路径，不需要下载裁判权重，也不占 GPU。根据 [DeepSeek 官方更新日志](https://api-docs.deepseek.com/zh-cn/updates/)，V4.1 Flash 当前 API 模型 ID 是 `deepseek-flash`；脚本调用官方 `https://api.deepseek.com/chat/completions`，使用非思考模式和 JSON Output。
+
+复制模板并把 API key 写入本地配置：
+
+```bash
+cp configs/deepseek_api.example.json configs/deepseek_api.json
+chmod 600 configs/deepseek_api.json
+```
+
+编辑 `configs/deepseek_api.json`：
+
+```json
+{
+  "api_key": "sk-在这里填写你的真实key",
+  "base_url": "https://api.deepseek.com",
+  "model": "deepseek-flash"
+}
+```
+
+真实的 `configs/deepseek_api.json` 已加入 `.gitignore`，模板文件不含密钥。脚本不会把 API key 或配置文件路径复制进 `scoring_config.json`、逐题结果或日志；输出只记录实际使用的 base URL 和模型 ID。仍保留 `DEEPSEEK_API_KEY` 环境变量作为未配置文件时的兼容回退。
+
+然后对已经生成的回答评分：
+
+```bash
+python -m src.interaction.score_emma_deepseek \
+  --test_data_path data/emma/prepared/TEST.jsonl \
+  --predictions outputs/eval_emma_interaction/predictions.jsonl \
+  --output_dir outputs/eval_emma_interaction/deepseek_flash \
+  --api_config configs/deepseek_api.json \
+  --workers 4
+```
+
+`--predictions` 推荐使用原始 `predictions.jsonl`，也兼容现有 Qwen/fast 产生的 `predictions_scored.jsonl`。后一种情况下会先清除旧评分器的判定、理由和 token 用量，仅保留原模型 response 与生成元数据，避免两套裁判结果串在一起；仍应写到新的 DeepSeek output_dir。
+
+评分策略固定记录为 `emma_lenient_reference_mention_v1`，严格执行本实验要求：
+
+- 模型回答与标准答案语义等效，判对。
+- 回答中任何位置明确提到标准答案或等效表达，也判对；不要求它是最终答案。即使回答随后否定该答案、同时提到别的答案或最终选择不同答案，仍判对。
+- 选择题中，单独出现正确选项字母或正确选项内容算提到；普通单词或冠词内部碰巧包含同一字母不算。
+- 空回答，或完全没有标准答案/等效表达，判错。
+
+这是刻意宽松的 **reference mention** 指标，通常会高于官方 EMMA 评分和论文裁判分数，不能混称为官方 accuracy。比较 baseline 与训练后模型时，两边必须使用这个相同脚本和策略。裁判仅接收文字题面、选项、模型 response、标准答案字母及对应选项内容；不需要重新读取图片或重新生成模型回答。
+
+DeepSeek 返回逐题 JSON：`correct`、`judge_reason`、`matched_reference`，并保存原始 `judge_response`、服务实际返回的模型名、request ID 和 token usage。`metrics.json` 除各科准确率外，还汇总请求 token 和缓存命中 token。完整裁判 prompt、模型 ID、API 地址和输入预测文件哈希保存在 `scoring_config.json` 并进入运行签名；API key 不会进入签名或产物。
+
+若网络超时、限流、API 返回非 JSON、输出截断或字段不合法，该题保持 `correct=null`，不会误算成答错，命令也会非零退出。修复后原命令加 `--resume`，只重试失败项：
+
+```bash
+python -m src.interaction.score_emma_deepseek \
+  --test_data_path data/emma/prepared/TEST.jsonl \
+  --predictions outputs/eval_emma_interaction/predictions.jsonl \
+  --output_dir outputs/eval_emma_interaction/deepseek_flash \
+  --api_config configs/deepseek_api.json \
+  --workers 4 --resume
+```
+
+默认每题最多重试 3 次、超时 120 秒、并发 4。遇到平台限流可降到 `--workers 1`；`--attempts`、`--timeout` 可调整。官方兼容的 `/v1` 地址也可通过 `--base_url https://api.deepseek.com/v1` 使用。模型默认固定为 `deepseek-flash`，不要再使用已退役、仅临时兼容路由的旧 V4 Flash ID。
+
+如果只有 rank 文件，使用 shell 展开：
+
+```bash
+--predictions outputs/eval_emma_interaction/predictions_rank*.jsonl
+```
+
+不要同时传合并文件和 rank 文件；重复 pid 会明确报错。`--allow_partial` 仍只用于诊断，不能作为完整测试结果。
+
+## 6. 暂时没有 72B 裁判：先跑官方快速规则
 
 ```bash
 python -m src.interaction.score_emma \
@@ -190,7 +259,7 @@ python -m src.interaction.score_emma \
 
 快速规则不能覆盖所有开放题自然语言等价表达，与 72B 裁判的分数可能不同。报告时注明 `fast` 或 `judge`；不要将 fast 分数直接称为论文判分结果。之后准备好裁判，直接复用同一 `predictions.jsonl` 运行第 4 节。
 
-## 6. 看哪些指标
+## 7. 看哪些指标
 
 - `accuracy`：全部题目的正确率，取值 0–1；任何题尚未成功评分则为 null。
 - `by_subject`：Chemistry、Coding、Math、Physics 的题数和准确率。
@@ -199,27 +268,29 @@ python -m src.interaction.score_emma \
 - `token_limit_count`：达到生成预算的题数；不会从准确率分母里删除。
 - `pending`、`scored`、`complete_test_coverage`：检查评分故障和是否只测了一部分。
 - `ilvr_exact_reproduction=false`：记录前述未公开细节和训练来源差异，不表示程序报错。
+- DeepSeek 路径额外提供 `grading_policy`、`model` 和 `usage`；`judge_reason`/`matched_reference` 位于逐题结果中。
 
 保留 baseline 和训练后模型的完整输出目录，以及裁判模型下载版本和 vLLM 版本。两次评分应使用同一个裁判服务/权重。
 
-## 7. 已做的验证
+## 8. 已做的验证
 
 本地 CPU 环境已完成：
 
 - 官方 mini 全部 400 题转换、图片可读性和计数检查。
 - 与固定版本官方实现比较：800 个 CoT/Direct query、616 次图片引用经预处理后的像素内容、400 个裁判 prompt 均一致；五图题 `chem_82` 的真实 processor 输出 `input_ids`、`image_grid_thw`、`pixel_values` 逐项一致。
 - 用金标准构造 400 条合成回答，完整跑通官方 fast 评分入口，结果为 400/400；这只验证评分程序，不是待测模型准确率。另验证错误答案、空回答、嵌套 boxed 和分数等价。
-- EMMA 测试与原 VSP 回归共 20 项通过，包含数据错误、图片顺序、答案不进入 prompt、裁判异常不误算为错误、评分恢复与入口输出。
+- 当前 EMMA、DeepSeek、VSP、Zebra 和评测状态共 40 项 CPU 测试通过；DeepSeek 部分覆盖请求格式、JSON 严格解析、API key 不落盘、异常不误算为错误、token 汇总和断点重试。真实 DeepSeek API 未在测试中收费调用。
 
 安装依赖后可运行：
 
 ```bash
-python -m unittest tests.test_interaction_emma tests.test_interaction_vsp tests.test_interaction_vsp_audit -v
+python -m unittest tests.test_interaction_emma tests.test_interaction_emma_deepseek \
+  tests.test_interaction_vsp tests.test_interaction_vsp_audit -v
 ```
 
-本地未运行真实 CUDA 模型生成或 72B 裁判，也未测得模型在 EMMA 上的准确率；这两步需要在你的服务器按上面的命令执行。完整 2788 题的数据计数依据官方数据集元信息，逐题比对在 mini 上完成。
+本地未运行真实 CUDA 模型生成、72B 裁判或 DeepSeek 付费 API，也未测得模型在 EMMA 上的准确率；这些步骤需要在你的服务器按上面的命令执行。完整 2788 题的数据计数依据官方数据集元信息，逐题比对在 mini 上完成。
 
-## 8. 多卡完成不同步、超时与续跑
+## 9. 多卡完成不同步、超时与续跑
 
 旧版在评测结束时才调用 NCCL barrier，默认超时 600 秒。如果某卡已完成、其他卡仍在处理较慢题目，快卡可能等待超时；torchrun 随后终止其余进程。日志中的 `rank 2 ...100/100` 只代表该卡完成，不代表四卡都完成；`GPU ... currently unknown` 也不能单独证明 GPU 映射出错。[PyTorch 超时说明](https://docs.pytorch.org/docs/2.6/distributed.html#torch.distributed.init_process_group)
 
@@ -269,6 +340,6 @@ nvidia-smi
 
 `CUDA_VISIBLE_DEVICES=2,3,5,7` 时，local rank 3 对应物理 GPU 7。结合 `--tee 3` 保存的各进程日志，找 rank 3 自己**最早的 Traceback**，不要只看最后的 `ChildFailedError`。
 
-如果四个 rank 文件其实已包含完整 400 题，合并阶段失败也不必重跑生成：第 4/5 节评分命令可直接使用 `--predictions outputs/eval_emma_interaction/predictions_rank*.jsonl`。评分入口会检查覆盖范围和重复题；文件不完整时先续跑，不用 `--allow_partial` 冒充完整集结果。
+如果四个 rank 文件其实已包含完整 400 题，合并阶段失败也不必重跑生成：第 4/5/6 节评分命令可直接使用 `--predictions outputs/eval_emma_interaction/predictions_rank*.jsonl`。评分入口会检查覆盖范围和重复题；文件不完整时先续跑，不用 `--allow_partial` 冒充完整集结果。
 
 本次修复通过 27 项 CPU 测试，包括中断续跑、已完成题不重复生成和进度回调不改变 8/9 步生成结果；另用真实两进程 Gloo，让第二个进程晚 2 秒完成，验证等待和合并。Linux 四卡 CUDA 场景仍需服务器复测。

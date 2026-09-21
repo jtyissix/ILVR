@@ -1,4 +1,4 @@
-"""CoMT/VSP evaluation and EMMA response generation with continuous latents."""
+"""CoMT/VSP/Zebra evaluation and EMMA response generation with continuous latents."""
 import argparse
 from collections import defaultdict
 from datetime import timedelta
@@ -13,7 +13,7 @@ from .distributed import rank, world
 from .evaluation_state import EvaluationProgress, check_resume_config, load_rank_records
 from .generation import generate_continuous
 from .model import input_embeddings, load_full_model
-from . import vsp, emma
+from . import vsp, emma, zebra
 
 
 def task_category(sample):
@@ -54,12 +54,13 @@ def main():
     parser.add_argument("--test_data_path", required=True)
     parser.add_argument("--image_root", required=True)
     parser.add_argument("--output_dir", required=True)
-    parser.add_argument("--task", choices=["comt", "vsp", "emma"], default="comt")
+    parser.add_argument("--task", choices=["comt", "vsp", "emma", "zebra"], default="comt")
+    parser.add_argument("--zebra_subset", choices=["all", *zebra.TASKS], default="all")
     parser.add_argument("--vsp_prompt_style", choices=vsp.PROMPT_STYLES, default="ilvr_eval",
                         help="VSP prompt only: ilvr_eval matches official eval.py; mirage_marker reproduces the previous layout")
-    parser.add_argument("--max_new_tokens", type=int, default=None, help="Default: EMMA 4096, CoMT/VSP 1024")
+    parser.add_argument("--max_new_tokens", type=int, default=None, help="Default: EMMA/Zebra 4096, CoMT/VSP 1024")
     parser.add_argument("--max_input_tokens", type=int, default=32768,
-                        help="EMMA input limit: fail with pid rather than truncate a multi-image question")
+                        help="EMMA/Zebra input limit: fail with pid rather than truncate a question")
     parser.add_argument("--attention_backend", choices=["sdpa", "flash_attention_2"], default="flash_attention_2")
     parser.add_argument("--resume", action="store_true", help="Append missing samples to an interrupted run with the same inputs and world size")
     parser.add_argument("--sync_timeout_seconds", type=int, default=14400,
@@ -68,7 +69,7 @@ def main():
                         help="Report token-generation progress at this interval; does not impose a generation time limit")
     args = parser.parse_args()
     if args.max_new_tokens is None:
-        args.max_new_tokens = 4096 if args.task == "emma" else 1024
+        args.max_new_tokens = 4096 if args.task in ("emma", "zebra") else 1024
     if min(args.max_new_tokens, args.max_input_tokens, args.sync_timeout_seconds, args.progress_interval_seconds) <= 0:
         parser.error("Token limits and time intervals must be positive")
     # Validate before allocating GPU model replicas; VSP never needs gold answer text.
@@ -76,6 +77,10 @@ def main():
         samples, data_report = vsp.load_samples(args.test_data_path, args.image_root)
     elif args.task == "emma":
         samples, data_report = emma.load_samples(args.test_data_path, args.image_root)
+    elif args.task == "zebra":
+        print(f"Validating prepared Zebra data: {args.test_data_path}", flush=True)
+        samples, data_report = zebra.load_samples(args.test_data_path, args.image_root, subset=args.zebra_subset)
+        zebra.ilvr_rules()  # Fail before model loading if the audited scoring rules changed.
     else:
         with Path(args.test_data_path).open(encoding="utf-8") as handle:
             samples = [json.loads(line) for line in handle if line.strip()]
@@ -116,6 +121,8 @@ def main():
                    "prompt_style": prompt_style, "do_sample": False,
                    "ilvr_prompt_source_revision": vsp.ILVR_PROMPT_REVISION if args.task != "emma" else None,
                    "emma_prompt_source_revision": emma.EMMA_REVISION if args.task == "emma" else None,
+                   **({"zebra_protocol": zebra.PROTOCOL, "zebra_rule_ast_sha256": zebra.OFFICIAL_RULE_AST_SHA256}
+                      if args.task == "zebra" else {}),
                    "scoring_status": "pending_offline_scoring" if args.task == "emma" else "inline",
                    "vision_attention": sorted({type(block.attn).__name__ for block in model.visual.blocks}),
                    "coordination_backend": "gloo" if world() > 1 else "none"}
@@ -166,13 +173,13 @@ def main():
             text = processor.apply_chat_template([message], tokenize=False, add_generation_prompt=True, **template_options)
             batch = processor(text=[text], images=pictures or None, return_tensors="pt", padding=True)
             grids = batch["image_grid_thw"].tolist() if pictures else []
-            if args.task == "emma" and batch["input_ids"].shape[-1] > args.max_input_tokens:
-                raise ValueError(f"EMMA {sample['pid']}: {batch['input_ids'].shape[-1]} input tokens exceed "
+            if args.task in ("emma", "zebra") and batch["input_ids"].shape[-1] > args.max_input_tokens:
+                raise ValueError(f"{args.task.upper()} {sample['pid']}: {batch['input_ids'].shape[-1]} input tokens exceed "
                                  f"--max_input_tokens {args.max_input_tokens}; question was not truncated")
-            if args.task == "emma":
+            if args.task in ("emma", "zebra"):
                 print(f"[rank {rank()}] generating index={index} pid={sample['pid']} "
                       f"images={len(pictures)} input_tokens={batch['input_ids'].shape[-1]}", flush=True)
-            if args.task in ("vsp", "emma") and index == rank():
+            if args.task in ("vsp", "emma", "zebra") and index == rank():
                 # Capture the actual template output and expanded token IDs, not a
                 # separately reconstructed prompt. One small diagnostic file/rank.
                 json_write(output / f"prompt_rank{rank()}.json", {
@@ -206,6 +213,8 @@ def main():
                 scored = vsp.score(sample, raw)
             elif args.task == "emma":
                 scored = emma.pending_record(sample, raw)
+            elif args.task == "zebra":
+                scored = zebra.score(sample, raw)
             else:
                 prediction = extract_final_answer(raw)
                 correct = normalize_for_match(prediction) == normalize_for_match(str(sample["original_final_answer"]))
@@ -242,6 +251,9 @@ def main():
             metrics = {**emma.summarize(merged), "scoring": "pending_offline_scoring", "data": data_report,
                        "ilvr_exact_reproduction": False}
             json_write(output / "emma_responses.json", emma.official_results(samples, merged))
+        elif args.task == "zebra":
+            metrics = {**zebra.summarize(merged), "scoring": "ilvr_rule_exact_match", "data": data_report,
+                       "rule_source_revision": zebra.ILVR_REVISION, "rule_ast_sha256": zebra.OFFICIAL_RULE_AST_SHA256}
         else:
             metrics = vsp.summarize(merged) if args.task == "vsp" else summarize(merged)
         json_write(output / "metrics.json", metrics)
