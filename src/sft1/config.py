@@ -12,11 +12,11 @@ def default_sources():
     return [
         {"name": "comt", "path": "../comt_rewrite_output/hard/TRAIN.jsonl",
          "image_root": "data/comt", "plan_field": "thought_rewritten",
-         "answer_field": "answer", "require_structured_actions": True},
+         "answer_field": "answer", "require_structured_actions": True, "allow_append_final_answer": True},
         {"name": "refocus", "path": "../refocus_bbox_output/hard_cropped.jsonl",
          "image_root": "../refocus_bbox_output", "plan_field": "sequence_plan",
          "question_field": "question", "images_field": "image", "answer_field": "answer",
-         "require_structured_actions": True},
+         "require_structured_actions": True, "allow_append_final_answer": True},
         {"name": "visual_cot", "path": "../visual_cot_grounded_causal_v2_output/train.comt.jsonl",
          "image_root": "../visual_cot_grounded_causal_v2_output", "plan_field": "sequence_plan",
          "answer_field": "original_final_answer", "require_structured_actions": True},

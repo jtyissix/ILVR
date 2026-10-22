@@ -8,6 +8,7 @@
       "image_root": "/home/fit/renjujty/WORK/jty/ilvr-train/ILVR/data/comt/",
       "plan_field": "thought_rewritten",
       "answer_field": "answer",
+      "allow_append_final_answer": true,
       "require_structured_actions": true
     },
     {
@@ -18,6 +19,7 @@
       "question_field": "question",
       "images_field": "image",
       "answer_field": "answer",
+      "allow_append_final_answer": true,
       "require_structured_actions": true
     },
     {

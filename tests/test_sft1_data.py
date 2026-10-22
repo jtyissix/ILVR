@@ -12,7 +12,7 @@ import torch
 
 from src.sft1.data import (
     WarmupCollator, WarmupDataset, _processor_identity, normalize_sample,
-    prepare_dataset, prepare_sample,
+    prepare_dataset, prepare_sample, validate_tokenizer_capacity,
 )
 
 
@@ -26,6 +26,9 @@ class FakeTokenizer:
 
     def __len__(self):
         return 512
+
+    def get_vocab(self):
+        return {**self.special, **{f"token_{i}": i for i in range(6, 512)}}
 
     def encode(self, text, add_special_tokens=False):
         result, cursor = [], 0
@@ -126,6 +129,28 @@ class WarmupDataTest(unittest.TestCase):
         return prepare_sample(row or self.row, self.source, self.processor, self.model,
                               kwargs.get("max_seq_length", 4096))
 
+    def test_padded_model_vocabulary_is_valid_but_out_of_range_ids_are_rejected(self):
+        padded = {**self.model, "vocab_size": 640}
+        validate_tokenizer_capacity(self.processor, padded)
+        record = prepare_sample(self.row, self.source, self.processor, padded, 4096)
+        self.assertEqual(record["input_ids"], self.record()["input_ids"])
+        with self.assertRaisesRegex(ValueError, "Tokenizer IDs do not fit"):
+            validate_tokenizer_capacity(self.processor, {**self.model, "vocab_size": 511})
+        with self.assertRaisesRegex(ValueError, "exceeds model capacity"):
+            prepare_sample(self.row, self.source, self.processor, {**self.model, "vocab_size": 511}, 4096)
+        with mock.patch.object(self.processor.tokenizer, "get_vocab",
+                               return_value={**self.processor.tokenizer.get_vocab(), "sparse_id": 640}):
+            with self.assertRaisesRegex(ValueError, "max_token_id=640"):
+                validate_tokenizer_capacity(self.processor, padded)
+        with self.assertRaisesRegex(ValueError, "special token mismatch"):
+            validate_tokenizer_capacity(self.processor, {**padded, "image_token_id": 6})
+
+    def test_encoded_out_of_range_id_is_rejected_even_with_short_tokenizer(self):
+        row = copy.deepcopy(self.row)
+        row["text_input"] += chr(600)
+        with self.assertRaisesRegex(ValueError, "Encoded token ID"):
+            self.record(row)
+
     def test_explicit_rewritten_field_and_original_action_order(self):
         record = self.record()
         supervised = self.processor.tokenizer.decode([v for v in record["labels"] if v != -100])
@@ -171,6 +196,12 @@ class WarmupDataTest(unittest.TestCase):
             self.record(row)
         result = normalize_sample(row, {**self.source, "allow_append_final_answer": True})
         self.assertEqual(result["sequence"][-1]["content"], "The final answer is: red")
+        record = prepare_sample(row, {**self.source, "allow_append_final_answer": True},
+                                self.processor, self.model, 4096)
+        supervised = self.processor.tokenizer.decode([label for label in record["labels"] if label != -100])
+        self.assertIn("The final answer is: red", supervised)
+        self.assertIn("<|im_end|>", supervised)
+        self.assertEqual(row["thought_rewritten"][-1]["content"], "Need to inspect more.")
         row["original_final_answer"] = "2"
         row["thought_rewritten"][-1]["content"] = "There are 12 items."
         with self.assertRaisesRegex(ValueError, "Final answer is missing"):
@@ -181,6 +212,8 @@ class WarmupDataTest(unittest.TestCase):
         row["original_final_answer"] = "blue"
         with self.assertRaisesRegex(ValueError, "Final answer is missing"):
             self.record(row)
+        with self.assertRaisesRegex(ValueError, "Final answer is missing"):
+            normalize_sample(row, {**self.source, "allow_append_final_answer": True})
         row = copy.deepcopy(self.row)
         row["thought_rewritten"].append({"type": "latent", "helper_image": "helper.png"})
         with self.assertRaisesRegex(ValueError, "must end"):

@@ -20,7 +20,7 @@ python run_sft1.py
 
 默认 CoMT 读取 `thought_rewritten`，答案字段为 `answer`；ReFocus 读取完成裁图的 `sequence_plan`，题目/题图/答案字段为 `question/image/answer`。Visual CoT 读取完成 grounding 的 `train.comt.jsonl`，Zebra 读取 v2 的 `hard_rewritten.jsonl`。默认路径按项目改写脚本的输出目录提供，需按实际文件核对。题图和 helper 必须真实存在；已有绝对图片路径迁移到服务器后需要先修正。
 
-结构化文字使用 `analysis.content` 与 `action.original_text`，不把动作标签或元数据当正文。四个源默认 `require_structured_actions: true`：含 helper 的记录必须有结构化动作，避免误读旧的扁平计划。默认严格要求计划末尾含 final answer，且与配置的答案字段一致；缺失、截断、非法 helper 或演示记录直接报错。特殊源确实只有答案元数据时，可显式设置该源的 `allow_append_final_answer: true`，追加原答案；默认不启用。
+结构化文字使用 `analysis.content` 与 `action.original_text`，不把动作标签或元数据当正文。四个源默认 `require_structured_actions: true`：含 helper 的记录必须有结构化动作，避免误读旧的扁平计划。进入训练的序列末尾必须含 final answer，且与配置的答案字段一致。CoMT、ReFocus 已启用 `allow_append_final_answer: true`：末尾没有答案且没有显式 final 标记时，将原 `answer` 字段追加为末尾文字并计算 CE；已有答案不重复追加，原数据文件不修改。显式 final 标记与答案冲突、缺少可用答案、非法 helper 或演示记录仍报错。Visual CoT、Zebra 默认要求改写计划本身带 final answer。
 
 ## 执行与超参
 

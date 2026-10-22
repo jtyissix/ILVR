@@ -189,8 +189,11 @@ def prepare_sample(sample, source, processor, model_config, max_seq_length,
     tokenizer = processor.tokenizer
     if tokenizer.pad_token_id is None:
         raise ValueError("The checkpoint tokenizer needs an existing pad_token_id")
-    if len(tokenizer) != model_config["vocab_size"]:
-        raise ValueError("Tokenizer and model vocabulary differ; SFT 1 must not add tokens")
+    # Qwen may reserve extra embedding/head rows. Token IDs must fit; the
+    # tokenizer length does not need to equal the model's padded capacity.
+    if len(tokenizer) > model_config["vocab_size"]:
+        raise ValueError(f"Tokenizer vocabulary ({len(tokenizer)}) exceeds model capacity "
+                         f"({model_config['vocab_size']}); use the matching checkpoint tokenizer")
     for text in [normalized["question"], *(s["content"] for s in normalized["sequence"] if s["type"] == "text")]:
         if any(token and token in text for token in getattr(tokenizer, "all_special_tokens", [])):
             raise ValueError("Raw training text contains a tokenizer special token")
@@ -213,6 +216,9 @@ def prepare_sample(sample, source, processor, model_config, max_seq_length,
             pictures.append(picture.convert("RGB"))
     encoded = processor(text=[full_text], images=pictures or None, return_tensors="pt")
     original_ids = encoded["input_ids"][0].tolist()
+    if any(token < 0 or token >= model_config["vocab_size"] for token in
+           (*original_ids, tokenizer.pad_token_id)):
+        raise ValueError("Encoded token ID exceeds model vocabulary capacity")
     grids = encoded["image_grid_thw"].tolist() if "image_grid_thw" in encoded else []
     if len(grids) != len(all_paths):
         raise ValueError("Processor did not preserve every question/helper image")
@@ -332,10 +338,31 @@ def _processor_identity(processor):
                         "vocab_size": len(processor.tokenizer)})
 
 
+def validate_tokenizer_capacity(processor, model_config):
+    """Check the shared tokenizer once before scanning thousands of samples."""
+    tokenizer = processor.tokenizer
+    capacity = model_config["vocab_size"]
+    vocab = tokenizer.get_vocab()
+    if not vocab or len(tokenizer) > capacity or any(i < 0 or i >= capacity for i in vocab.values()):
+        largest = max(vocab.values(), default=-1)
+        raise ValueError(f"Tokenizer IDs do not fit the model: tokenizer_size={len(tokenizer)}, "
+                         f"max_token_id={largest}, model_vocab_size={capacity}. "
+                         "Use the matching checkpoint tokenizer; no vocabulary resize is performed.")
+    if tokenizer.pad_token_id is None or not 0 <= tokenizer.pad_token_id < capacity:
+        raise ValueError("The checkpoint tokenizer needs an existing pad_token_id within model capacity")
+    for token, field in (("<|image_pad|>", "image_token_id"),
+                         ("<|vision_start|>", "vision_start_token_id"),
+                         ("<|vision_end|>", "vision_end_token_id")):
+        if vocab.get(token) != model_config[field]:
+            raise ValueError(f"Tokenizer/model special token mismatch: {token} maps to "
+                             f"{vocab.get(token)}, but {field}={model_config[field]}")
+
+
 def prepare_dataset(config):
     source_info = _source_inventory(config.sources)
     inventory = checkpoint_inventory(config.model_path)
     processor = load_processor(config)
+    validate_tokenizer_capacity(processor, inventory["config"])
     records, errors, image_stats, counts = [], [], {}, {}
     for source in source_info:
         counts[source["name"]] = 0
