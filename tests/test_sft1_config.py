@@ -54,7 +54,7 @@ class ConfigTest(unittest.TestCase):
         self.assertTrue(config.skip_overlong_samples)
         self.assertTrue(config.shrink_overlong_images)
         self.assertEqual(config.max_seq_length, 32768)
-        self.assertEqual(configure_deepspeed(config)["zero_optimization"]["stage"], 1)
+        self.assertEqual(configure_deepspeed(config)["zero_optimization"]["stage"], 2)
         self.assertEqual(len(config.sources), 4)
         self.assertEqual(config.sources[0]["plan_field"], "thought_rewritten")
         self.assertEqual(config.sources[0]["answer_field"], "original_final_answer")
@@ -100,18 +100,29 @@ class ConfigTest(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "call schedules"):
                 configure_deepspeed(WarmupConfig(deepspeed=str(path)))
 
-    def test_zero1_locks_fixed_order_post_backward_reduction(self):
-        config = WarmupConfig.load(DEFAULT_CONFIG)
-        ds = configure_deepspeed(config)
-        self.assertEqual(ds["zero_optimization"]["stage"], 1)
-        self.assertIs(ds["zero_optimization"]["overlap_comm"], False)
+    def test_zero1_and_zero2_lock_their_supported_reduction_settings(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "zero.json"
-            for change in ({"stage": 2}, {"overlap_comm": True}, {"reduce_scatter": True},
-                           {"offload_optimizer": {"device": "cpu"}}):
-                altered = json.loads(json.dumps(ds))
-                altered["zero_optimization"].update(change)
-                path.write_text(json.dumps(altered))
+            for stage in (1, 2):
+                ds = configure_deepspeed(WarmupConfig(deepspeed=str(PROJECT_ROOT / f"configs/sft1/zero{stage}.json")))
+                self.assertEqual(ds["zero_optimization"]["stage"], stage)
+                self.assertIs(ds["zero_optimization"]["overlap_comm"], False)
+                for change in ({"overlap_comm": True}, {"reduce_scatter": stage != 2},
+                               {"contiguous_gradients": False}, {"round_robin_gradients": True},
+                               {"offload_optimizer": {"device": "cpu"}}):
+                    altered = json.loads(json.dumps(ds))
+                    altered["zero_optimization"].update(change)
+                    path.write_text(json.dumps(altered))
+                    with self.subTest(stage=stage, change=change), self.assertRaises(ValueError):
+                        configure_deepspeed(WarmupConfig(deepspeed=str(path)))
+
+    def test_zero2_rejects_mismatched_communication_dtype_and_autocast(self):
+        ds = configure_deepspeed(WarmupConfig.load(DEFAULT_CONFIG))
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "zero.json"
+            for change in ({"communication_data_type": "fp32"}, {"torch_autocast": {"enabled": True}},
+                           {"fp16": {"enabled": True}}):
+                path.write_text(json.dumps({**ds, **change}))
                 with self.subTest(change=change), self.assertRaises(ValueError):
                     configure_deepspeed(WarmupConfig(deepspeed=str(path)))
 

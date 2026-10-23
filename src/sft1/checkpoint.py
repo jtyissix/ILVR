@@ -84,7 +84,9 @@ def load_training(engine, path, signature, source_hash):
     state = json.loads((path / "complete.json").read_text(encoding="utf-8"))
     if (state.get("format") != "sft1-warmup-v1" or state.get("signature") != signature
             or state.get("initial_backbone_fingerprint") != source_hash or state.get("world_size") != world()):
-        raise ValueError("Resume rejected: SFT-I configuration, data, world size, or initial backbone changed")
+        raise ValueError("Resume rejected: SFT-I configuration (including DeepSpeed/ZeRO stage), data, "
+                         "world size, or initial backbone changed. If only the ZeRO stage changed, "
+                         "reuse the existing prepared data with a new optimizer run.")
     rng_path = path / f"rng_rank{rank()}.pt"
     if not rng_path.is_file():
         raise FileNotFoundError(f"Incomplete SFT-I checkpoint: {rng_path}")
@@ -100,7 +102,7 @@ def load_training(engine, path, signature, source_hash):
 
 
 def _cpu_state(module):
-    # ZeRO-1 retains complete model parameters. Clone tied storage for safetensors.
+    # ZeRO-1 and ZeRO-2 retain complete model parameters. Clone tied storage for safetensors.
     return {name: tensor.detach().cpu().contiguous().clone() for name, tensor in module.state_dict().items()}
 
 
@@ -114,7 +116,7 @@ def export_warmup(engine, visual, processor, output, config, source_hash):
             from .modules import IMAGE_INDEX_ENCODING, POSITION_ENCODING
             student = engine.module
             if any(hasattr(parameter, "ds_id") for parameter in student.parameters()):
-                raise ValueError("SFT-I export supports replicated ZeRO-1 weights, not ZeRO-3 partitions")
+                raise ValueError("SFT-I export supports replicated ZeRO-1/2 weights, not ZeRO-3 partitions")
             output = Path(output)
             output.mkdir(parents=True, exist_ok=True)
             backbone = output / "backbone"

@@ -26,9 +26,9 @@ python run_sft1.py
 
 `mode` 为 `train`、`prepare_only` 或 `smoke`。`prepare_only` 只严格校验并缓存数据，不需要 GPU；`smoke` 使用真实训练流程、默认在 2 个 optimizer steps 后保存，可用 `smoke_steps` 调整。建议 smoke 使用单独 `output_dir`。`max_steps` 是总 optimizer step 上限，`null` 按 `epochs` 完整训练；上限不改变按完整 epoch 规划的学习率曲线。
 
-类默认值为微批 1、梯度累积 2、3 epochs、BF16、ZeRO-1；主干 LR `2e-6`，interaction 与 adapter LR `5e-5`，实际以 JSON 为准。`adapter_lr: null` 跟随 `fusion_lr`。`min_image_pixels/max_image_pixels` 控制图像处理，`max_seq_length: 32768` 是完整交错序列上限。短边不足 Qwen patch factor（通常 28）的图片按比例放大，原文件不修改。全局默认 `shrink_overlong_images: true`：仅对超长样本逐步降低图片像素预算，按比例缩放并对齐 Qwen 网格，直到实际完整序列不超过 32768；保留全部 analysis、action 原文、图片顺序和 final answer。不要求恰好填满 32768。每条样本的图片预算写入缓存，在训练时原样复用。
+类默认值为微批 1、梯度累积 2、3 epochs、BF16、ZeRO-2；主干 LR `2e-6`，interaction 与 adapter LR `5e-5`，实际以 JSON 为准。`adapter_lr: null` 跟随 `fusion_lr`。`min_image_pixels/max_image_pixels` 控制图像处理，`max_seq_length: 32768` 是完整交错序列上限。短边不足 Qwen patch factor（通常 28）的图片按比例放大，原文件不修改。全局默认 `shrink_overlong_images: true`：仅对超长样本逐步降低图片像素预算，按比例缩放并对齐 Qwen 网格，直到实际完整序列不超过 32768；保留全部 analysis、action 原文、图片顺序和 final answer。不要求恰好填满 32768。每条样本的图片预算写入缓存，在训练时原样复用。
 
-`skip_overlong_samples: true` 是缩图后的兜底：文字本身过长，或图片缩到最低预算仍无法满足上限时，才排除完整样本，并写入 `skipped_records.jsonl`。两项同时为 `true` 时先 resize 再 skip；两项都为 `false` 时超长报错。该策略对 CoMT、ReFocus、Visual CoT、Zebra 全部生效，先前因超长被跳过的样本会在重建缓存时重新尝试缩图。保持 ZeRO-1，未增加序列上限。
+`skip_overlong_samples: true` 是缩图后的兜底：文字本身过长，或图片缩到最低预算仍无法满足上限时，才排除完整样本，并写入 `skipped_records.jsonl`。两项同时为 `true` 时先 resize 再 skip；两项都为 `false` 时超长报错。该策略对 CoMT、ReFocus、Visual CoT、Zebra 全部生效，先前因超长被跳过的样本会在重建缓存时重新尝试缩图。切换 ZeRO 阶段不改变这套策略或序列上限。
 
 预处理默认 `prepare_workers: 4` 个 CPU 进程，`prepare_log_seconds: 5` 秒输出进度；`prepare_workers: 1` 可串行排查。与训练 DataLoader 的 `num_workers` 独立。任务和待写结果数量有上限，结果按原始源/行号顺序流式写出，不把全量 token 序列留在内存。终端显示完成/总数、成功、排除、错误、降分辨率数量、速度、用时和预计剩余时间。数据准备和所有源/图片/权重核查完成后才启动多卡进程，避免预处理触发分布式超时；不要绕过入口直接启动训练模块。
 
@@ -44,7 +44,13 @@ python run_sft1.py
 
 需要 Linux CUDA/BF16 环境、仓库已有的 `requirements-interaction.txt` 依赖和该仓库 Transformers；启动器自动优先加载本仓库 Transformers。`attention_backend` 默认 `flash_attention_2`，无 FlashAttention 环境可改 `sdpa`。
 
-多卡固定使用 **ZeRO-1、`overlap_comm: false`**，在反传结束后按固定参数顺序归约。不同样本的 helper 数量使梯度产生顺序不同，普通 ZeRO-2 的动态桶可能错配；因此拒绝 ZeRO-2，ZeRO-3 的模块调用对齐也尚未实现。ZeRO-1 仍分片 optimizer 状态，但每卡保留完整梯度，显存需求高于 ZeRO-2。配置还锁定 `reduce_scatter: false`、`contiguous_gradients: true`，暂不支持 optimizer offload、ZenFlow 或 DeepCompile。依据 [DeepSpeed 0.18 官方实现](https://github.com/deepspeedai/DeepSpeed/blob/v0.18.0/deepspeed/runtime/zero/stage_1_and_2.py)。
+多卡默认使用 **ZeRO-2**（`configs/sft1/zero2.json`），锁定项目依赖中的 **DeepSpeed 0.18.0**。`src/sft1/zero2.py` 将已就绪的梯度按各卡一致的参数顺序交给原生 ZeRO-2 reducer，避免不同 helper 数量造成动态桶错配。它只暂存参数引用，不复制整模型梯度；反传期间持续归约、释放非本卡分片，裁剪、优化器更新和保存仍由 DeepSpeed 完成。完整轨迹只反传一次，文字状态与 KV 的计算图保留。
+
+同时兼容修复 0.18.0 的 ZeRO-2 梯度累积问题：原生 epilogue 用只在累积边界填充的 `averaged_gradients` 判断是否已有梯度，导致之前微批的梯度被覆盖。此处移植 [DeepSpeed 0.18.3 的修复](https://github.com/deepspeedai/DeepSpeed/blob/v0.18.3/deepspeed/runtime/zero/stage_1_and_2.py)，改为检查真实累积缓冲 `all_grad_tensors`，继续使用原生分片布局与生命周期。无需修改安装包或更换依赖版本。
+
+固定顺序优先 LM head、倒序 decoder 层，较小的 interaction/adapter 可以等待；不是等全部梯度就绪后才统一归约。每个微批检查全部参数恰好就绪一次，启动时核对各卡参数名称、形状、组内位置和归约顺序。日志 `zero2_pending_grad_peak_gib` 记录等待排序的梯度量，`peak_allocated_gib` 是实际显存峰值。配置使用 `overlap_comm: false`、`reduce_scatter: true`、`contiguous_gradients: true`，归约/聚合桶为 2000 万元素。BF16 参数使用 BF16 通信，规避该版本超桶参数在混合通信精度下的限制。暂不支持 offload、ZenFlow、DeepCompile、torch_autocast、模型/序列并行。仍可显式选择 `zero1.json`；ZeRO-3 尚未实现。依据 [DeepSpeed 0.18 官方实现](https://github.com/deepspeedai/DeepSpeed/blob/v0.18.0/deepspeed/runtime/zero/stage_1_and_2.py)。
+
+**这次 ZeRO-1 → ZeRO-2 不需要重做 prepare。** 保持 `prepared_dir`、数据源与图片/序列配置，`mode: train` 会直接校验并复用现有版本 4 缓存，只更新启动预检凭据。不要为切换 ZeRO 设置 `prepare_only`。ZeRO-1 的优化器断点不能当作 ZeRO-2 断点直接恢复；若原输出目录已保存 checkpoint，应设置一个新的 `output_dir`，`resume: null`，继续使用原 `prepared_dir`。ZeRO-2 自身的断点可正常续训。
 
 ## 模型和监督
 
@@ -83,4 +89,8 @@ Linux 多卡环境另提供独立验收入口，无需下载模型或准备正�
 python -m tests.test_sft1_deepspeed
 ```
 
-GPU 数量等选项位于该文件顶部。此脚本使用 FP32，对照单模型处理所有 rank 样本的结果，检查不同 helper 数量、空样本、全局 CE 归一化、ZeRO-1 更新及断点续训。当前工作区尚未执行多卡验收；环境不满足时显示 `skipped`，不视为通过。
+GPU 数量等选项位于该文件顶部。此脚本默认依次验证 ZeRO-2、ZeRO-1，使用 FP32 对照单模型处理所有 rank 样本的结果，检查不同 helper 数量、无题图、连续 helper、纯文字及全 mask 样本、全局 CE 归一化、实际更新梯度与动量断点续训。257 元素的小桶会触发多个桶及超桶参数路径，并实际检查各卡梯度就绪顺序不同。该脚本不等同于正式 32768 长度的 BF16 显存压力测试；环境不满足时显示 `skipped`，不视为通过。
+
+另有 `python -m tests.test_sft1_zero2_bf16`，默认 4 卡、BF16、AdamW、8 次累积、裁剪与断点重放。先用独立的普通模型反传/all-reduce 检查分片梯度，再用核验后的梯度独立执行 FP32 master AdamW，避免把 BF16 近零梯度舍入导致的符号变化误判为优化器错误。它也会自动启动 torchrun，参数集中在文件顶部。
+
+本次本地验证已通过原生 DeepSpeed 0.18.0 的 2/4 进程 CPU/Gloo FP32 对照：ZeRO-2 四进程最大参数差约 `5.96e-8`，各 rank 参数一致，断点继续训练一致。另通过四进程 BF16、AdamW、8 次梯度累积和实际触发的梯度裁剪：归约梯度相对 L2 差小于 `0.051%`（BF16 舍入），使用核验后的梯度独立执行 FP32 master AdamW，更新权重完全一致，断点重放逐位一致。真实小型 Qwen 的单卡 CUDA BF16 前后向也通过。尚未在 4×A800 上运行正式模型、32768 长度的 NCCL/FlashAttention 显存压力测试。

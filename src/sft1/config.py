@@ -34,7 +34,7 @@ class WarmupConfig:
     sources: list[dict] = field(default_factory=default_sources)
     prepared_dir: str = "data/sft1/prepared"
     output_dir: str = "outputs/sft1_warmup"
-    deepspeed: str = "configs/sft1/zero1.json"
+    deepspeed: str = "configs/sft1/zero2.json"
     gpu_ids: list[int] | None = None  # null = keep CUDA_VISIBLE_DEVICES unchanged
     num_gpus: int | None = None  # null = use all visible GPUs
     epochs: int = 3

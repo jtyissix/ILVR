@@ -16,6 +16,7 @@ from ..interaction.data import json_write, stable_hash
 from ..interaction.distributed import GlobalBatchSampler, cosine_factor, normalized_loss, rank, sum_scalar, to_device, world
 from .checkpoint import export_warmup, load_training, resume_signature, save_training
 from .config import DEFAULT_CONFIG, WarmupConfig, validate_local_inputs
+from .zero2 import check_zero2_version, install_ordered_zero2
 
 
 def primary_call(function):
@@ -55,16 +56,18 @@ def configure_deepspeed(config):
     ds = json.loads(Path(config.deepspeed).read_text(encoding="utf-8"))
     zero = ds.get("zero_optimization", {})
     stage = zero.get("stage")
-    if stage != 1:
-        raise ValueError("SFT-I requires ZeRO-1 with overlap_comm=false: variable helper graphs can produce "
-                         "different gradient hook order across ranks, so ordinary ZeRO-2 buckets are unsafe. "
-                         "ZeRO-3 also needs aligned module call schedules that are not implemented.")
+    if stage not in (1, 2):
+        raise ValueError("SFT-I supports ZeRO-1 or ordered ZeRO-2. ZeRO-3 requires aligned module call schedules.")
     if zero.get("overlap_comm") is not False:
-        raise ValueError("Set overlap_comm=false explicitly: SFT-I reduces in fixed parameter order after backward")
-    if zero.get("reduce_scatter") is not False or zero.get("contiguous_gradients") is not True:
-        raise ValueError("SFT-I requires reduce_scatter=false and contiguous_gradients=true")
-    if any(zero.get(key) for key in ("offload_optimizer", "offload_param", "zenflow")) or ds.get("zenflow") or ds.get("deepcompile"):
+        raise ValueError("Set overlap_comm=false explicitly for fixed-order SFT-I reduction")
+    if zero.get("reduce_scatter") is not (stage == 2) or zero.get("contiguous_gradients") is not True:
+        raise ValueError("SFT-I requires contiguous_gradients=true; reduce_scatter must be true for ZeRO-2, false for ZeRO-1")
+    if any(zero.get(key) for key in ("offload_optimizer", "offload_param", "zenflow", "round_robin_gradients")) or ds.get("zenflow") or ds.get("deepcompile"):
         raise ValueError("Optimizer/parameter offload, ZenFlow and DeepCompile are not supported by this SFT-I recipe")
+    if ds.get("torch_autocast", {}).get("enabled") or ds.get("fp16", {}).get("enabled"):
+        raise ValueError("SFT-I uses BF16 parameters without FP16 or torch_autocast")
+    if stage == 2 and ds.get("communication_data_type", "bf16") != "bf16":
+        raise ValueError("DeepSpeed 0.18.0 ordered ZeRO-2 requires BF16 communication with BF16 parameters")
     if not ds.get("bf16", {}).get("enabled"):
         raise ValueError("SFT-I requires BF16 in the DeepSpeed configuration")
     if "optimizer" in ds or "scheduler" in ds:
@@ -110,6 +113,8 @@ def train(config):
         raise RuntimeError(f"GPU {local_rank} does not support the required BF16 training")
     device = torch.device("cuda", local_rank)
     import deepspeed
+    if configure_deepspeed(config)["zero_optimization"]["stage"] == 2:
+        check_zero2_version(deepspeed.__version__)
     deepspeed.init_distributed(dist_backend="nccl")
     random.seed(config.seed + rank())
     np.random.seed(config.seed + rank())
@@ -133,6 +138,10 @@ def train(config):
     ds_config = configure_deepspeed(config)
     engine, _, _, _ = deepspeed.initialize(model=student, optimizer=optimizer, lr_scheduler=scheduler,
                                           config=ds_config, dist_init_required=False)
+    ordered_reducer = install_ordered_zero2(engine)
+    if rank() == 0 and ordered_reducer:
+        print("SFT-I ZeRO-2 ready: fixed-order gradient partitioning, accumulation compatibility fix enabled; "
+              f"gradient_accumulation_steps={config.gradient_accumulation_steps}.", flush=True)
     signature = resume_signature(config, dataset_hash, source)
     epoch_start, start_window = 0, 0
     if config.resume:
@@ -142,7 +151,10 @@ def train(config):
     if rank() == 0:
         json_write(output / "run_info.json", {
             "world_size": world(), "gpu": torch.cuda.get_device_name(), "torch": torch.__version__,
-            "deepspeed": deepspeed.__version__, "zero_stage": 1,
+            "deepspeed": deepspeed.__version__, "zero_stage": ds_config["zero_optimization"]["stage"],
+            "gradient_reduction": "ordered_streaming" if ordered_reducer else "post_backward",
+            "gradient_order_sha256": ordered_reducer.order_sha256 if ordered_reducer else None,
+            "zero2_accumulation_fix": "upstream_0.18.3" if ordered_reducer else None,
             "effective_batch": world() * config.micro_batch_size * config.gradient_accumulation_steps,
             "total_optimizer_steps": total_steps, "step_limit": config.step_limit,
             "initial_backbone_fingerprint": source, "dataset_sha256": dataset_hash, "signature": signature,
@@ -175,6 +187,7 @@ def train(config):
             local_loss = torch.zeros((), device=device, dtype=torch.float32)
             torch.cuda.reset_peak_memory_stats()
             before_step = engine.global_steps
+            pending_peak_bytes = 0
             for cpu_batch in window:
                 batch = to_device(cpu_batch, device)
                 features = encode_images(visual, batch)
@@ -183,6 +196,8 @@ def train(config):
                 loss_sum = engine(batch, image_features=features)
                 local_loss += loss_sum.detach().float()
                 engine.backward(normalized_loss(loss_sum, count, config.gradient_accumulation_steps, world()))
+                if ordered_reducer:
+                    pending_peak_bytes = max(pending_peak_bytes, ordered_reducer.peak_pending_bytes)
                 engine.step()
                 del loss_sum, features, batch
             if engine.global_steps != before_step + 1:
@@ -192,17 +207,18 @@ def train(config):
             torch.cuda.synchronize()
             seconds = time.perf_counter() - tick
             loss_value = sum_scalar(local_loss.item(), device) / count
-            perf = torch.tensor([seconds, torch.cuda.max_memory_allocated() / 1024**3],
+            perf = torch.tensor([seconds, torch.cuda.max_memory_allocated() / 1024**3, pending_peak_bytes / 1024**3],
                                 device=device, dtype=torch.float64)
             if dist.is_initialized():
                 dist.all_reduce(perf, op=dist.ReduceOp.MAX)
-            seconds, peak_gib = perf.tolist()
+            seconds, peak_gib, pending_peak_gib = perf.tolist()
             if rank() == 0 and (engine.global_steps % config.log_steps == 0 or engine.global_steps == 1):
                 record = {"step": engine.global_steps, "epoch": epoch, "next_window": window_index,
                           "ce_loss": loss_value, "effective_tokens": count, "samples": samples,
                           "tokens_per_second": count / seconds, "samples_per_second": samples / seconds,
                           "step_seconds": seconds, "data_seconds": data_seconds,
-                          "peak_allocated_gib": peak_gib, "lr": scheduler.get_last_lr()}
+                          "peak_allocated_gib": peak_gib, "zero2_pending_grad_peak_gib": pending_peak_gib,
+                          "lr": scheduler.get_last_lr()}
                 print(json.dumps(record), flush=True)
                 with (output / "metrics.jsonl").open("a", encoding="utf-8") as handle:
                     handle.write(json.dumps(record) + "\n")

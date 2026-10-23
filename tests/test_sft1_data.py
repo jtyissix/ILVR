@@ -329,6 +329,66 @@ class WarmupDataTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "checksum"):
             WarmupDataset(config.prepared_dir)
 
+    def test_zero_stage_switch_reuses_prepared_files_but_rejects_optimizer_resume(self):
+        from src.sft1.checkpoint import load_training, resume_signature
+        from src.sft1.config import WarmupConfig
+        from src.sft1.prepare import prepare, read_preflight
+
+        path = self.root / "source.jsonl"
+        path.write_text(json.dumps(self.row) + "\n", encoding="utf-8")
+        model_path = self.root / "model"
+        model_path.mkdir()
+        (model_path / "config.json").write_text(json.dumps(self.model), encoding="utf-8")
+        for stage in (1, 2):
+            (self.root / f"zero{stage}.json").write_text(
+                json.dumps({"zero_optimization": {"stage": stage}}), encoding="utf-8")
+        config = WarmupConfig(
+            sources=[{**self.source, "path": str(path)}], model_path=str(model_path),
+            prepared_dir=str(self.root / "prepared"), output_dir=str(self.root / "output"),
+            deepspeed=str(self.root / "zero1.json"), max_seq_length=4096,
+            prepare_workers=1, prepare_log_seconds=1,
+        )
+        inventory = {"config": self.model, "metadata": {"test": "fixed"}, "fingerprint": "model-stat"}
+        with mock.patch("src.sft1.data.checkpoint_inventory", return_value=inventory), \
+             mock.patch("src.sft1.data.load_processor", return_value=self.processor), \
+             mock.patch("src.sft1.preprocessing.checkpoint_inventory", return_value=inventory), \
+             mock.patch("src.sft1.preprocessing.load_processor", return_value=self.processor):
+            manifest = prepare_dataset(config)
+            signature = resume_signature(config, "dataset", "initial")
+            cache_root = Path(config.prepared_dir)
+            before = {item.name: (item.read_bytes(), item.stat().st_mtime_ns)
+                      for item in cache_root.iterdir() if item.is_file()}
+
+            config.deepspeed = str(self.root / "zero2.json")
+            dataset = WarmupDataset(config.prepared_dir)
+            dataset.validate_sources(config)
+            self.assertEqual(dataset.manifest, manifest)
+            new_signature = resume_signature(config, "dataset", "initial")
+            self.assertNotEqual(signature, new_signature)
+
+            # The launcher refreshes its receipt, but must never rebuild prepared records.
+            with mock.patch("src.sft1.data.prepare_dataset", side_effect=AssertionError("cache was rebuilt")), \
+                 mock.patch("src.sft1.train.configure_deepspeed"), \
+                 mock.patch("src.sft1.prepare.checkpoint_inventory", return_value=inventory), \
+                 mock.patch("src.sft1.prepare.source_fingerprint", return_value="initial"), \
+                 mock.patch.dict("os.environ", {"SFT1_PREFLIGHT_ID": "zero2-cache-reuse-test"}):
+                receipt = prepare(config)
+                self.assertEqual(read_preflight(config), receipt)
+            after = {item.name: (item.read_bytes(), item.stat().st_mtime_ns)
+                     for item in cache_root.iterdir() if item.is_file()}
+            self.assertEqual(after, before)
+
+        checkpoint = self.root / "old-zero1-checkpoint"
+        checkpoint.mkdir()
+        (checkpoint / "complete.json").write_text(json.dumps({
+            "format": "sft1-warmup-v1", "signature": signature,
+            "initial_backbone_fingerprint": "initial", "world_size": 1,
+        }), encoding="utf-8")
+        engine = mock.Mock()
+        with self.assertRaisesRegex(ValueError, "ZeRO stage"):
+            load_training(engine, checkpoint, new_signature, "initial")
+        engine.load_checkpoint.assert_not_called()
+
     def test_real_qwen_processor_complete_images_labels_and_native_mrope(self):
         from tests.test_interaction_qwen import tiny_qwen
         processor = real_qwen_processor()

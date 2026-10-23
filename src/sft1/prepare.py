@@ -27,6 +27,9 @@ def prepare(config):
     if config.mode == "prepare_only" or not (Path(config.prepared_dir) / "manifest.json").is_file():
         print("Preparing and validating all SFT-I sources before distributed startup...", flush=True)
         prepare_dataset(config)
+    else:
+        print(f"Reusing prepared SFT-I cache: {config.prepared_dir} (no data preprocessing); validating cached files...",
+              flush=True)
     dataset = WarmupDataset(config.prepared_dir)
     dataset.validate_sources(config)
     print("Verifying the initial local checkpoint fingerprint...", flush=True)

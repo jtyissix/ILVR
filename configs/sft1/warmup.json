@@ -43,7 +43,7 @@
   ],
   "prepared_dir": "data/sft1/prepared",
   "output_dir": "outputs/sft1_warmup",
-  "deepspeed": "configs/sft1/zero1.json",
+  "deepspeed": "configs/sft1/zero2.json",
   "gpu_ids": null,
   "num_gpus": null,
   "epochs": 3,
