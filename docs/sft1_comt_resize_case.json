@@ -1,0 +1,164 @@
+{
+  "source": "comt",
+  "line": 660,
+  "original_length": 84142,
+  "length": 29234,
+  "max_seq_length": 32768,
+  "non_visual_tokens": 338,
+  "original_visual_tokens": 83804,
+  "visual_tokens": 28896,
+  "images": [
+    {
+      "path": "images_comt/deletion/0041.png",
+      "kind": "question",
+      "image_id": 0,
+      "original_size": [
+        4096,
+        2304
+      ],
+      "initial_processed_size": [
+        4088,
+        2296
+      ],
+      "processed_size": [
+        2408,
+        1344
+      ],
+      "original_visual_tokens": 11972,
+      "visual_tokens": 4128,
+      "max_pixels": 3268944,
+      "sha256": "4064c70c503e2ca19aaeb41c5a60419ae125580ed4eb5319a075167111137ce2"
+    },
+    {
+      "path": "images_comt/deletion/0041_1.png",
+      "kind": "helper",
+      "image_id": 0,
+      "original_size": [
+        4096,
+        2304
+      ],
+      "initial_processed_size": [
+        4088,
+        2296
+      ],
+      "processed_size": [
+        2408,
+        1344
+      ],
+      "original_visual_tokens": 11972,
+      "visual_tokens": 4128,
+      "max_pixels": 3268944,
+      "sha256": "ce81efda3110315e2dccbf9d7accd4290b6356f165c5a819c73ebc568e812678"
+    },
+    {
+      "path": "images_comt/deletion/0041_2.png",
+      "kind": "helper",
+      "image_id": 1,
+      "original_size": [
+        4096,
+        2304
+      ],
+      "initial_processed_size": [
+        4088,
+        2296
+      ],
+      "processed_size": [
+        2408,
+        1344
+      ],
+      "original_visual_tokens": 11972,
+      "visual_tokens": 4128,
+      "max_pixels": 3268944,
+      "sha256": "aa4f49dc8732298a9805e1ef465cfe7f1ee3b7da6d4807536d299f9be14ed7ab"
+    },
+    {
+      "path": "images_comt/deletion/0041_3.png",
+      "kind": "helper",
+      "image_id": 2,
+      "original_size": [
+        4096,
+        2304
+      ],
+      "initial_processed_size": [
+        4088,
+        2296
+      ],
+      "processed_size": [
+        2408,
+        1344
+      ],
+      "original_visual_tokens": 11972,
+      "visual_tokens": 4128,
+      "max_pixels": 3268944,
+      "sha256": "6fef82d5fa38daec565e45237488d00c33ccff51d5a81e25ad05fba896024ce0"
+    },
+    {
+      "path": "images_comt/deletion/0041_4.png",
+      "kind": "helper",
+      "image_id": 3,
+      "original_size": [
+        4096,
+        2304
+      ],
+      "initial_processed_size": [
+        4088,
+        2296
+      ],
+      "processed_size": [
+        2408,
+        1344
+      ],
+      "original_visual_tokens": 11972,
+      "visual_tokens": 4128,
+      "max_pixels": 3268944,
+      "sha256": "c0bcd33e65a33aea01140da4168715692ea7c1d6a77df47dba17c55343cc7943"
+    },
+    {
+      "path": "images_comt/deletion/0041_5.png",
+      "kind": "helper",
+      "image_id": 4,
+      "original_size": [
+        4096,
+        2304
+      ],
+      "initial_processed_size": [
+        4088,
+        2296
+      ],
+      "processed_size": [
+        2408,
+        1344
+      ],
+      "original_visual_tokens": 11972,
+      "visual_tokens": 4128,
+      "max_pixels": 3268944,
+      "sha256": "9c932cb9da5b55aebec23cb393901cb0a9f6b6bda9f19e862bee6b89811005e4"
+    },
+    {
+      "path": "images_comt/deletion/0041_6.png",
+      "kind": "helper",
+      "image_id": 5,
+      "original_size": [
+        4096,
+        2304
+      ],
+      "initial_processed_size": [
+        4088,
+        2296
+      ],
+      "processed_size": [
+        2408,
+        1344
+      ],
+      "original_visual_tokens": 11972,
+      "visual_tokens": 4128,
+      "max_pixels": 3268944,
+      "sha256": "3a7f657fca43d6f56daff9f40a2828c1d8ea0b1f0e06d775bd0760cea0226cff"
+    }
+  ],
+  "question": "Can you ascertain the quantity of people captured in the image? option:[35, 45, 55, 65]",
+  "final_answer": "55",
+  "public_archive": "https://huggingface.co/datasets/shuai22/comt/resolve/main/comt.tar.gz",
+  "tokenizer_sha256": "55b76f98b2c2ca7c24fc62a0775fdb2db68a29790eefa5f295ce8c74aef987fc",
+  "note": "Real images from the public CoMT archive, with the supplied rewritten TRAIN.jsonl. Text token counts use the locally cached Qwen2.5-VL/ILVR tokenizer and chat template; server-specific templates may differ."
+}

@@ -26,7 +26,9 @@ python run_sft1.py
 
 `mode` 为 `train`、`prepare_only` 或 `smoke`。`prepare_only` 只严格校验并缓存数据，不需要 GPU；`smoke` 使用真实训练流程、默认在 2 个 optimizer steps 后保存，可用 `smoke_steps` 调整。建议 smoke 使用单独 `output_dir`。`max_steps` 是总 optimizer step 上限，`null` 按 `epochs` 完整训练；上限不改变按完整 epoch 规划的学习率曲线。
 
-类默认值为微批 1、梯度累积 2、3 epochs、BF16、ZeRO-1；主干 LR `2e-6`，interaction 与 adapter LR `5e-5`，实际以 JSON 为准。`adapter_lr: null` 跟随 `fusion_lr`。`min_image_pixels/max_image_pixels` 控制图像处理，`max_seq_length` 是完整交错序列上限。短边不足 Qwen patch factor（通常 28）的图片按比例放大，原文件不修改。`skip_overlong_samples: true` 默认将超过上限的完整样本排除，源文件、行号、实际长度和上限写入 `skipped_records.jsonl`，不截断文字或答案。`shrink_overlong_images` 默认 `false`，不为超长样本额外降低分辨率。若以后需要保留超长样本并尝试压缩图片，设置 `skip_overlong_samples: false`、`shrink_overlong_images: true`；缩放策略写入缓存并在训练时复用。若两项都为 `false`，超长样本直接报错；启用 skip 时优先排除。
+类默认值为微批 1、梯度累积 2、3 epochs、BF16、ZeRO-1；主干 LR `2e-6`，interaction 与 adapter LR `5e-5`，实际以 JSON 为准。`adapter_lr: null` 跟随 `fusion_lr`。`min_image_pixels/max_image_pixels` 控制图像处理，`max_seq_length: 32768` 是完整交错序列上限。短边不足 Qwen patch factor（通常 28）的图片按比例放大，原文件不修改。全局默认 `shrink_overlong_images: true`：仅对超长样本逐步降低图片像素预算，按比例缩放并对齐 Qwen 网格，直到实际完整序列不超过 32768；保留全部 analysis、action 原文、图片顺序和 final answer。不要求恰好填满 32768。每条样本的图片预算写入缓存，在训练时原样复用。
+
+`skip_overlong_samples: true` 是缩图后的兜底：文字本身过长，或图片缩到最低预算仍无法满足上限时，才排除完整样本，并写入 `skipped_records.jsonl`。两项同时为 `true` 时先 resize 再 skip；两项都为 `false` 时超长报错。该策略对 CoMT、ReFocus、Visual CoT、Zebra 全部生效，先前因超长被跳过的样本会在重建缓存时重新尝试缩图。保持 ZeRO-1，未增加序列上限。
 
 预处理默认 `prepare_workers: 4` 个 CPU 进程，`prepare_log_seconds: 5` 秒输出进度；`prepare_workers: 1` 可串行排查。与训练 DataLoader 的 `num_workers` 独立。任务和待写结果数量有上限，结果按原始源/行号顺序流式写出，不把全量 token 序列留在内存。终端显示完成/总数、成功、排除、错误、降分辨率数量、速度、用时和预计剩余时间。数据准备和所有源/图片/权重核查完成后才启动多卡进程，避免预处理触发分布式超时；不要绕过入口直接启动训练模块。
 
@@ -35,6 +37,7 @@ python run_sft1.py
 - `progress.json`：启动即创建，持续更新阶段、全局进度和各数据源统计。
 - `validation_errors.jsonl`：发现错误即追加；`validation_errors.json` 每次进度更新时保存快照。
 - `skipped_records.jsonl`：按配置排除的原始源、行号及原因。
+- `resized_records.jsonl`：逐条记录超长样本缩图前后的总长度、视觉/非视觉 token 数，以及每张图的原始尺寸、常规处理尺寸、最终尺寸、token 数和像素预算；尺寸统一为 `[宽, 高]`。同一张图在序列中出现多次也逐次计数。每个数据源的第一个缩图案例会在终端打印摘要。
 - `records.partial.jsonl`：持续写入成功结果，定期刷盘；全量通过后才发布为 `records.jsonl` 和 `manifest.json`。
 
 有真实校验错误时仍停止，不将错误记录悄悄丢弃。中断后的 partial 文件可排查，但当前不支持自动从 partial 续跑。`prepare_only` 会重建缓存；成功后改回 `train` 即可复用。
@@ -55,7 +58,7 @@ python run_sft1.py
 
 只计算 analysis、action 原文、final answer 和回答结束符的 CE；提示词、全部 interaction token、图像及边界、padding 不计 loss。三个 interaction token 均占用实际序列位置且参与因果注意力。一个样本完整分段前向后才反传；分布式按整个累积窗口的有效文字 token 总数归一化。没有 latent 回归、蒸馏或额外辅助 loss。
 
-interaction token 数量、图片处理策略或超长排除策略改变后，旧数据缓存必须重建：将 `mode` 设为 `prepare_only` 运行入口，完成后改回 `train`。当前缓存版本为 3，会拒绝此前缓存；旧单 token 模块检查点也不能直接续训为三个 token。
+interaction token 数量、图片处理策略、序列长度预算或超长排除策略改变后，旧数据缓存必须重建：将 `mode` 设为 `prepare_only` 运行入口，完成后改回 `train`。当前缓存版本为 4，会拒绝此前缓存，避免旧的全局 skip 结果遗漏可通过缩图保留的样本；旧单 token 模块检查点也不能直接续训为三个 token。
 
 ## 保存、续训和后续阶段
 

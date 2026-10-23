@@ -56,8 +56,8 @@ class WarmupConfig:
     adapter_layers: int = 2
     adapter_slots: int = 16
     interaction_tokens: int = 3
-    shrink_overlong_images: bool = False
-    skip_overlong_samples: bool = True
+    shrink_overlong_images: bool = True  # Try a smaller per-image budget before excluding a row.
+    skip_overlong_samples: bool = True  # Skip only if the enabled resize policy still cannot fit.
     prepare_workers: int = 4  # CPU processes; 1 runs serially for debugging.
     prepare_log_seconds: int = 5
     attention_backend: str = "flash_attention_2"

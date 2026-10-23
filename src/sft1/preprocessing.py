@@ -54,7 +54,7 @@ def _process_one(task, processor, config, model_config):
             return {**result, "status": "skipped", "reason": reason}
         record = prepare_sample(sample, source, processor, model_config, config.max_seq_length,
                                 config.interaction_tokens,
-                                config.shrink_overlong_images and not config.skip_overlong_samples)
+                                config.shrink_overlong_images)
         record.update(source=source["name"], source_line=line)
         stats = {}
         for image in record["images"]:
@@ -72,6 +72,17 @@ def _process_one(task, processor, config, model_config):
 
 def _worker_task(task):
     return _process_one(task, *_WORKER)
+
+
+def resize_report(record, max_seq_length):
+    """Keep per-occurrence geometry and token accounting, without full token arrays."""
+    keys = ("path", "kind", "image_id", "original_size", "initial_processed_size", "processed_size",
+            "original_visual_tokens", "visual_tokens", "max_pixels")
+    return {"source": record["source"], "line": record["source_line"],
+            "original_length": record["original_length"], "length": record["length"],
+            "max_seq_length": max_seq_length, "non_visual_tokens": record["non_visual_tokens"],
+            "original_visual_tokens": record["original_visual_tokens"], "visual_tokens": record["visual_tokens"],
+            "images": [{key: image[key] for key in keys} for image in record["images"]]}
 
 
 def _tasks(sources):
@@ -177,6 +188,7 @@ def prepare_dataset(config):
             records_handle = stack.enter_context(partial.open("w", encoding="utf-8", newline="\n"))
             error_log = stack.enter_context((output / "validation_errors.jsonl").open("w", encoding="utf-8"))
             skip_log = stack.enter_context((output / "skipped_records.jsonl").open("w", encoding="utf-8"))
+            resize_log = stack.enter_context((output / "resized_records.jsonl").open("w", encoding="utf-8"))
             tasks = _tasks(source_info)
             if config.prepare_workers == 1:
                 results = (_process_one(task, processor, config, inventory["config"]) for task in tasks)
@@ -203,6 +215,14 @@ def prepare_dataset(config):
                     adjusted = int(record["image_budget_reduced"])
                     reduced += adjusted
                     source_count["image_budget_reduced"] += adjusted
+                    if adjusted:
+                        resize_log.write(json.dumps(resize_report(record, config.max_seq_length), ensure_ascii=False) + "\n")
+                        resize_log.flush()
+                        if source_count["image_budget_reduced"] == 1:
+                            print(f"[prepare:resize] {result['source']}:{result['line']} "
+                                  f"length={record['original_length']}->{record['length']} "
+                                  f"visual_tokens={record['original_visual_tokens']}->{record['visual_tokens']}; "
+                                  "per-image sizes: resized_records.jsonl", flush=True)
                 elif result["status"] == "skipped":
                     skipped += 1
                     source_count["skipped"] += 1

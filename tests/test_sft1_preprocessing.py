@@ -56,6 +56,7 @@ class PreprocessingTest(unittest.TestCase):
                 with Image.open(self.root / "helper.png") as original:
                     self.assertEqual(original.size, size)
                 record = self.record()
+                self.assertEqual(record["images"][1]["original_size"], list(size))
                 collator = WarmupCollator(self.processor, self.model, {"processor_identity": _processor_identity(self.processor)})
                 batch = collator([record])
                 self.assertEqual(batch["visual"]["image_grid_thw"].tolist(), record["image_grid_thw"])
@@ -138,6 +139,44 @@ class PreprocessingTest(unittest.TestCase):
         self.assertEqual(result["status"], "error")
         self.assertIn("original_text", result["error"])
 
+    def test_resize_precedes_skip_and_reports_every_image_size_and_token_count(self):
+        short = {**self.row, "image_input": [],
+                 "thought_rewritten": [{"type": "text", "content": "answer 7"}]}
+        text_too_long = {**short, "thought_rewritten": [
+            {"type": "text", "content": "reason " * 120 + "answer 7"}]}
+        config = self.prepare_config([self.row, text_too_long, short])
+        config.skip_overlong_samples = True
+        original = self.record()
+        manifest = prepare_dataset(config)
+        directory = Path(config.prepared_dir)
+        self.assertEqual(manifest["samples"], 2)
+        self.assertEqual(manifest["skipped_samples"], 1)
+        self.assertEqual(manifest["image_budget_reduced"], 1)
+        records = [json.loads(s) for s in (directory / "records.jsonl").read_text().splitlines()]
+        resized = records[0]
+        self.assertEqual([v for v in resized["labels"] if v != -100],
+                         [v for v in original["labels"] if v != -100])
+        self.assertEqual(resized["final_answer_text"], original["final_answer_text"])
+        self.assertLessEqual(resized["length"], config.max_seq_length)
+        report = json.loads((directory / "resized_records.jsonl").read_text())
+        self.assertEqual(report["line"], 1)
+        self.assertEqual(report["source"], "comt")
+        self.assertEqual(report["original_length"], original["length"])
+        self.assertEqual(report["non_visual_tokens"] + report["visual_tokens"], report["length"])
+        self.assertEqual(report["non_visual_tokens"] + report["original_visual_tokens"], report["original_length"])
+        self.assertEqual(len(report["images"]), 2)
+        for image in report["images"]:
+            self.assertEqual(image["original_size"], [448, 448])
+            self.assertEqual(image["initial_processed_size"], [448, 448])
+            w, h = image["processed_size"]
+            self.assertLess(w, 448)
+            self.assertLess(h, 448)
+            self.assertEqual(w * h // (28 * 28), image["visual_tokens"])
+        skipped = json.loads((directory / "skipped_records.jsonl").read_text())
+        self.assertEqual(skipped["line"], 2)
+        self.assertEqual(skipped["reason"], "overlength trajectory")
+        self.assertEqual(json.loads((directory / "validation_errors.json").read_text()), [])
+
     def test_spawned_workers_match_serial_records_and_report_skips(self):
         unrewritten = {k: v for k, v in self.row.items() if k != "thought_rewritten"}
         config = self.prepare_config([self.row, unrewritten, {**self.row, "original_final_answer": ""}, self.row])
@@ -149,6 +188,8 @@ class PreprocessingTest(unittest.TestCase):
         parallel = Path(config.prepared_dir)
         self.assertEqual(first["records_sha256"], second["records_sha256"])
         self.assertEqual((serial / "records.jsonl").read_bytes(), (parallel / "records.jsonl").read_bytes())
+        self.assertEqual((serial / "resized_records.jsonl").read_bytes(),
+                         (parallel / "resized_records.jsonl").read_bytes())
         self.assertEqual(second["samples"], 2)
         self.assertEqual(second["skipped_samples"], 2)
         self.assertEqual(second["image_budget_reduced"], 2)

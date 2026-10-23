@@ -307,6 +307,10 @@ class WarmupDataTest(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "Overlength exclusion policy"):
                 dataset.validate_sources(config)
             config.skip_overlong_samples = False
+            config.max_seq_length = 8192
+            with self.assertRaisesRegex(ValueError, "Sequence length budget"):
+                dataset.validate_sources(config)
+            config.max_seq_length = 4096
             self.assertTrue(dataset[-1]["dummy"])
             self.assertFalse(dataset[0]["dummy"])
             config.max_image_pixels = 4096

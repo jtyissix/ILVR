@@ -19,7 +19,7 @@ from src.interaction.data import (
 
 from .config import WarmupConfig
 
-CACHE_VERSION = 3
+CACHE_VERSION = 4
 IMAGE_POLICY = "min_side_upscale_bicubic_and_per_record_pixel_cap_v1"
 _MISSING = object()
 _RESERVED = (*TOKENS.values(), "<|im_start|>", "<|im_end|>",
@@ -193,17 +193,18 @@ def _expanded_prompt(prompt, grids, processor):
     return value
 
 
-def load_training_image(path, image_processor):
+def load_training_image(path, image_processor, return_original_size=False):
     """Use the same aspect-preserving tiny-image repair in prepare and training."""
     from PIL import Image
     with Image.open(path) as original:
+        original_size = list(original.size)
         picture = original.convert("RGB")
     factor = getattr(image_processor, "patch_size", 14) * image_processor.merge_size
     width, height = picture.size
     if min(width, height) < factor:
         scale = factor / min(width, height)
         picture = picture.resize((math.ceil(width * scale), math.ceil(height * scale)), Image.Resampling.BICUBIC)
-    return picture
+    return (picture, original_size) if return_original_size else picture
 
 
 def image_processor_with_cap(image_processor, cap):
@@ -248,8 +249,11 @@ def prepare_sample(sample, source, processor, model_config, max_seq_length,
     full_text = processor.apply_chat_template([user, assistant], tokenize=False, add_generation_prompt=False)
     if not full_text.startswith(prompt):
         raise ValueError("Chat template does not have a consistent assistant prefix")
-    pictures = [load_training_image(path, processor.image_processor) for path in all_paths]
+    loaded = [load_training_image(path, processor.image_processor, return_original_size=True) for path in all_paths]
+    pictures = [picture for picture, _ in loaded]
+    original_sizes = [size for _, size in loaded]
     pixel_cap, original_length = None, None
+    original_grids = None
     minimum = getattr(processor.image_processor, "min_pixels", 3136)
     patch = getattr(processor.image_processor, "patch_size", 14)
     merge = processor.image_processor.merge_size
@@ -263,6 +267,8 @@ def prepare_sample(sample, source, processor, model_config, max_seq_length,
         encoded = active(text=[full_text], images=pictures or None, return_tensors="pt")
         original_ids = encoded["input_ids"][0].tolist()
         grids = encoded["image_grid_thw"].tolist() if "image_grid_thw" in encoded else []
+        if original_grids is None:
+            original_grids = grids
         length = len(original_ids) + interaction_tokens * (len(all_paths) - len(question_paths))
         original_length = original_length or length
         if length <= max_seq_length:
@@ -328,7 +334,13 @@ def prepare_sample(sample, source, processor, model_config, max_seq_length,
         boundary_start = len(ids)
         ids.extend(expected)
         labels.extend([-100] * len(expected))
+        initial_t, initial_h, initial_w = original_grids[index]
         images.append({"path": path, "grid": grid, "kind": kind, "max_pixels": pixel_cap,
+                       "original_size": original_sizes[index],
+                       "initial_processed_size": [initial_w * patch, initial_h * patch],
+                       "processed_size": [grid[2] * patch, grid[1] * patch],
+                       "original_visual_tokens": initial_t * initial_h * initial_w // (merge * merge),
+                       "visual_tokens": count,
                        "image_id": index if kind == "question" else index - len(question_paths),
                        "feature_start": feature_offset, "feature_end": feature_offset + count,
                        "token_start": boundary_start + 1, "token_end": boundary_start + 1 + count,
@@ -350,9 +362,12 @@ def prepare_sample(sample, source, processor, model_config, max_seq_length,
         raise ValueError("The assistant answer must include a supervised end-of-answer token")
     if not any(label != -100 for label in labels[1:]):
         raise ValueError("No supervised CE targets")
+    visual_tokens = sum(image["visual_tokens"] for image in images)
     return {"input_ids": ids, "labels": labels, "assistant_start": len(prefix),
             "segments": segments, "images": images, "image_grid_thw": grids,
             "length": len(ids), "original_length": original_length, "image_budget_reduced": pixel_cap is not None,
+            "original_visual_tokens": sum(image["original_visual_tokens"] for image in images),
+            "visual_tokens": visual_tokens, "non_visual_tokens": len(ids) - visual_tokens,
             "answer": normalized["answer"],
             "final_answer_text": normalized["final_answer_text"]}
 
@@ -446,6 +461,8 @@ class WarmupDataset:
             raise ValueError("Image resize policy changed; run prepare again")
         if self.manifest.get("skip_overlong_samples") != config.skip_overlong_samples:
             raise ValueError("Overlength exclusion policy changed; run prepare again")
+        if self.manifest.get("max_seq_length") != config.max_seq_length:
+            raise ValueError("Sequence length budget changed; run prepare again to reconsider skipped/resized records")
         if _source_inventory(config.sources) != self.manifest["source_info"]:
             raise ValueError("Data sources or field mappings changed; run prepare again")
         if checkpoint_inventory(config.model_path)["metadata"] != self.manifest["checkpoint_metadata"]:

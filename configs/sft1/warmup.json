@@ -65,7 +65,7 @@
   "adapter_layers": 2,
   "adapter_slots": 16,
   "interaction_tokens": 3,
-  "shrink_overlong_images": false,
+  "shrink_overlong_images": true,
   "skip_overlong_samples": true,
   "prepare_workers": 4,
   "prepare_log_seconds": 5,
