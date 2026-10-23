@@ -51,9 +51,11 @@ class ConfigTest(unittest.TestCase):
         config = WarmupConfig.load(DEFAULT_CONFIG)
         self.assertEqual(config.adapter_slots, 16)
         self.assertEqual(config.interaction_tokens, 3)
+        self.assertTrue(config.skip_overlong_samples)
+        self.assertFalse(config.shrink_overlong_images)
         self.assertEqual(len(config.sources), 4)
         self.assertEqual(config.sources[0]["plan_field"], "thought_rewritten")
-        self.assertEqual(config.sources[0]["answer_field"], "answer")
+        self.assertEqual(config.sources[0]["answer_field"], "original_final_answer")
         # The shipped JSON is user-editable, including the server checkpoint path.
         self.assertTrue(Path(config.model_path).is_absolute())
         self.assertTrue(all(Path(item["path"]).is_absolute() for item in config.sources))

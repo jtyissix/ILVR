@@ -29,7 +29,8 @@ def resume_signature(config, dataset_hash, source_hash):
     values = config.to_dict()
     # Runtime/logging/stop controls may change; training semantics and world size may not.
     for key in ("output_dir", "resume", "max_steps", "smoke_steps", "mode", "save_steps", "log_steps",
-                "num_workers", "prefetch_factor", "model_path", "prepared_dir", "gpu_ids", "num_gpus"):
+                "num_workers", "prefetch_factor", "model_path", "prepared_dir", "gpu_ids", "num_gpus",
+                "prepare_workers", "prepare_log_seconds"):
         values.pop(key, None)
     values["deepspeed"] = json.loads(Path(config.deepspeed).read_text(encoding="utf-8"))
     return stable_hash({"format": "sft1-warmup-v1", "config": values, "dataset": dataset_hash,

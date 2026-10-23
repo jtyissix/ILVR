@@ -12,7 +12,8 @@ def default_sources():
     return [
         {"name": "comt", "path": "../comt_rewrite_output/hard/TRAIN.jsonl",
          "image_root": "data/comt", "plan_field": "thought_rewritten",
-         "answer_field": "answer", "require_structured_actions": True, "allow_append_final_answer": True},
+         "answer_field": "original_final_answer", "require_structured_actions": True, "allow_append_final_answer": True,
+         "skip_missing_plan": True, "skip_empty_answer": True},
         {"name": "refocus", "path": "../refocus_bbox_output/hard_cropped.jsonl",
          "image_root": "../refocus_bbox_output", "plan_field": "sequence_plan",
          "question_field": "question", "images_field": "image", "answer_field": "answer",
@@ -55,6 +56,10 @@ class WarmupConfig:
     adapter_layers: int = 2
     adapter_slots: int = 16
     interaction_tokens: int = 3
+    shrink_overlong_images: bool = False
+    skip_overlong_samples: bool = True
+    prepare_workers: int = 4  # CPU processes; 1 runs serially for debugging.
+    prepare_log_seconds: int = 5
     attention_backend: str = "flash_attention_2"
     activation_checkpointing: bool = True
     ce_chunk_size: int = 256
@@ -84,7 +89,7 @@ class WarmupConfig:
         for name in ("epochs", "micro_batch_size", "gradient_accumulation_steps", "max_seq_length",
                      "min_image_pixels", "max_image_pixels", "fusion_dim", "fusion_heads", "fusion_ffn_dim",
                      "fusion_score_dim", "adapter_layers", "adapter_slots", "interaction_tokens", "ce_chunk_size", "prefetch_factor",
-                     "save_steps", "log_steps", "smoke_steps"):
+                     "save_steps", "log_steps", "smoke_steps", "prepare_workers", "prepare_log_seconds"):
             value = getattr(self, name)
             if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
                 raise ValueError(f"{name} must be a positive integer")
@@ -94,6 +99,10 @@ class WarmupConfig:
                 raise ValueError(f"{name} must be null or a positive integer")
         if self.fusion_dim % self.fusion_heads:
             raise ValueError("fusion_dim must be divisible by fusion_heads")
+        if not isinstance(self.shrink_overlong_images, bool):
+            raise ValueError("shrink_overlong_images must be boolean")
+        if not isinstance(self.skip_overlong_samples, bool):
+            raise ValueError("skip_overlong_samples must be boolean")
         if self.min_image_pixels > self.max_image_pixels:
             raise ValueError("min_image_pixels cannot exceed max_image_pixels")
         if not 0 <= self.warmup_ratio < 1 or self.num_workers < 0:
@@ -112,7 +121,8 @@ class WarmupConfig:
         if not isinstance(self.sources, list) or not self.sources:
             raise ValueError("sources must contain at least one explicitly configured rewritten dataset")
         allowed = {"name", "path", "image_root", "plan_field", "answer_field", "question_field", "images_field",
-                   "allow_append_final_answer", "json_records_key", "require_structured_actions"}
+                   "allow_append_final_answer", "json_records_key", "require_structured_actions",
+                   "skip_missing_plan", "skip_empty_answer"}
         names = set()
         for source in self.sources:
             if not isinstance(source, dict) or set(source) - allowed:
@@ -123,7 +133,7 @@ class WarmupConfig:
             if source["name"] in names:
                 raise ValueError(f"Duplicate source name: {source['name']}")
             names.add(source["name"])
-            for key in ("allow_append_final_answer", "require_structured_actions"):
+            for key in ("allow_append_final_answer", "require_structured_actions", "skip_missing_plan", "skip_empty_answer"):
                 if key in source and not isinstance(source[key], bool):
                     raise ValueError(f"{key} must be boolean")
         return self

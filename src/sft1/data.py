@@ -6,7 +6,9 @@ interaction block, immediately before that helper's complete vision block.
 """
 from __future__ import annotations
 
+import copy
 import json
+import math
 import re
 from pathlib import Path
 
@@ -17,9 +19,17 @@ from src.interaction.data import (
 
 from .config import WarmupConfig
 
-CACHE_VERSION = 2
+CACHE_VERSION = 3
+IMAGE_POLICY = "min_side_upscale_bicubic_and_per_record_pixel_cap_v1"
+_MISSING = object()
 _RESERVED = (*TOKENS.values(), "<|im_start|>", "<|im_end|>",
              "<|vision_start|>", "<|vision_end|>", "<|image_pad|>", "<|video_pad|>")
+
+
+class OverlengthTrajectoryError(ValueError):
+    def __init__(self, length, limit):
+        self.length, self.limit = length, limit
+        super().__init__(f"Overlength trajectory: {length} > {limit}; no truncation performed")
 
 
 def processor_settings(config):
@@ -36,6 +46,8 @@ def load_processor(config):
     # Set explicitly as well: older processor wrappers may consume kwargs themselves.
     for name, value in options.items():
         setattr(processor.image_processor, name, value)
+        if hasattr(processor.image_processor, "size"):
+            processor.image_processor.size["shortest_edge" if name == "min_pixels" else "longest_edge"] = value
     return processor
 
 
@@ -96,6 +108,9 @@ def normalize_sample(sample, source):
         raise ValueError("Each training sample must be an object")
     if _audit_demo(sample):
         raise ValueError("audit_demo_only records cannot enter training")
+    if "answer_field" in source and _field(sample, source["answer_field"], _MISSING) is _MISSING:
+        raise ValueError(f"Configured answer_field={source['answer_field']!r} is missing; "
+                         f"available top-level fields: {sorted(sample)}")
     plan_field = source.get("plan_field")
     if not isinstance(plan_field, str) or not plan_field:
         raise ValueError("Every source must explicitly specify plan_field")
@@ -178,11 +193,34 @@ def _expanded_prompt(prompt, grids, processor):
     return value
 
 
+def load_training_image(path, image_processor):
+    """Use the same aspect-preserving tiny-image repair in prepare and training."""
+    from PIL import Image
+    with Image.open(path) as original:
+        picture = original.convert("RGB")
+    factor = getattr(image_processor, "patch_size", 14) * image_processor.merge_size
+    width, height = picture.size
+    if min(width, height) < factor:
+        scale = factor / min(width, height)
+        picture = picture.resize((math.ceil(width * scale), math.ceil(height * scale)), Image.Resampling.BICUBIC)
+    return picture
+
+
+def image_processor_with_cap(image_processor, cap):
+    if cap is None:
+        return image_processor
+    result = copy.deepcopy(image_processor)
+    result.max_pixels = cap
+    if hasattr(result, "size"):
+        result.size["longest_edge"] = cap
+    return result
+
+
 def prepare_sample(sample, source, processor, model_config, max_seq_length,
-                   interaction_tokens=WarmupConfig.interaction_tokens):
+                   interaction_tokens=WarmupConfig.interaction_tokens,
+                   shrink_overlong_images=WarmupConfig.shrink_overlong_images):
     if isinstance(interaction_tokens, bool) or not isinstance(interaction_tokens, int) or interaction_tokens <= 0:
         raise ValueError("interaction_tokens must be a positive integer")
-    from PIL import Image
     normalized = normalize_sample(sample, source)
     question_paths = normalized["question_images"]
     all_paths = question_paths + [s["path"] for s in normalized["sequence"] if s["type"] == "image"]
@@ -210,16 +248,38 @@ def prepare_sample(sample, source, processor, model_config, max_seq_length,
     full_text = processor.apply_chat_template([user, assistant], tokenize=False, add_generation_prompt=False)
     if not full_text.startswith(prompt):
         raise ValueError("Chat template does not have a consistent assistant prefix")
-    pictures = []
-    for path in all_paths:
-        with Image.open(path) as picture:
-            pictures.append(picture.convert("RGB"))
-    encoded = processor(text=[full_text], images=pictures or None, return_tensors="pt")
-    original_ids = encoded["input_ids"][0].tolist()
+    pictures = [load_training_image(path, processor.image_processor) for path in all_paths]
+    pixel_cap, original_length = None, None
+    minimum = getattr(processor.image_processor, "min_pixels", 3136)
+    patch = getattr(processor.image_processor, "patch_size", 14)
+    merge = processor.image_processor.merge_size
+    if pictures:
+        minimum = max(minimum, math.ceil(max(max(p.size) / min(p.size) for p in pictures) * (patch * merge) ** 2))
+    while True:
+        active = processor
+        if pixel_cap is not None:
+            active = copy.copy(processor)
+            active.image_processor = image_processor_with_cap(processor.image_processor, pixel_cap)
+        encoded = active(text=[full_text], images=pictures or None, return_tensors="pt")
+        original_ids = encoded["input_ids"][0].tolist()
+        grids = encoded["image_grid_thw"].tolist() if "image_grid_thw" in encoded else []
+        length = len(original_ids) + interaction_tokens * (len(all_paths) - len(question_paths))
+        original_length = original_length or length
+        if length <= max_seq_length:
+            break
+        visual_tokens = sum(t * h * w // (merge * merge) for t, h, w in grids)
+        available = max_seq_length - (length - visual_tokens)
+        if (not shrink_overlong_images or not grids or available <= 0
+                or pixel_cap is not None and pixel_cap <= minimum):
+            raise OverlengthTrajectoryError(length, max_seq_length)
+        current = min(pixel_cap or math.inf, max(h * w * patch * patch for _, h, w in grids))
+        next_cap = max(minimum, int(current * min(0.8, 0.9 * available / visual_tokens)))
+        if pixel_cap is not None and next_cap >= pixel_cap:
+            raise OverlengthTrajectoryError(length, max_seq_length)
+        pixel_cap = next_cap
     if any(token < 0 or token >= model_config["vocab_size"] for token in
            (*original_ids, tokenizer.pad_token_id)):
         raise ValueError("Encoded token ID exceeds model vocabulary capacity")
-    grids = encoded["image_grid_thw"].tolist() if "image_grid_thw" in encoded else []
     if len(grids) != len(all_paths):
         raise ValueError("Processor did not preserve every question/helper image")
     prefix = tokenizer.encode(_expanded_prompt(prompt, grids[:len(question_paths)], processor),
@@ -268,7 +328,7 @@ def prepare_sample(sample, source, processor, model_config, max_seq_length,
         boundary_start = len(ids)
         ids.extend(expected)
         labels.extend([-100] * len(expected))
-        images.append({"path": path, "grid": grid, "kind": kind,
+        images.append({"path": path, "grid": grid, "kind": kind, "max_pixels": pixel_cap,
                        "image_id": index if kind == "question" else index - len(question_paths),
                        "feature_start": feature_offset, "feature_end": feature_offset + count,
                        "token_start": boundary_start + 1, "token_end": boundary_start + 1 + count,
@@ -279,7 +339,7 @@ def prepare_sample(sample, source, processor, model_config, max_seq_length,
             local_start = len(ids)
     append_text(len(original_ids))
     if len(ids) > max_seq_length:
-        raise ValueError(f"Overlength trajectory: {len(ids)} > {max_seq_length}; no truncation performed")
+        raise OverlengthTrajectoryError(len(ids), max_seq_length)
     end_tokens = {tokenizer.eos_token_id} - {None}
     # Qwen's chat template ends an assistant turn with im_end even when a
     # tokenizer's generic eos_token is endoftext (including stock constructors).
@@ -292,7 +352,8 @@ def prepare_sample(sample, source, processor, model_config, max_seq_length,
         raise ValueError("No supervised CE targets")
     return {"input_ids": ids, "labels": labels, "assistant_start": len(prefix),
             "segments": segments, "images": images, "image_grid_thw": grids,
-            "length": len(ids), "answer": normalized["answer"],
+            "length": len(ids), "original_length": original_length, "image_budget_reduced": pixel_cap is not None,
+            "answer": normalized["answer"],
             "final_answer_text": normalized["final_answer_text"]}
 
 
@@ -359,54 +420,9 @@ def validate_tokenizer_capacity(processor, model_config):
 
 
 def prepare_dataset(config):
-    source_info = _source_inventory(config.sources)
-    inventory = checkpoint_inventory(config.model_path)
-    processor = load_processor(config)
-    validate_tokenizer_capacity(processor, inventory["config"])
-    records, errors, image_stats, counts = [], [], {}, {}
-    for source in source_info:
-        counts[source["name"]] = 0
-        try:
-            for line, sample in _iter_rows(source):
-                try:
-                    record = prepare_sample(sample, source, processor, inventory["config"], config.max_seq_length,
-                                            config.interaction_tokens)
-                    record.update(source=source["name"], source_line=line)
-                    records.append(record)
-                    counts[source["name"]] += 1
-                    for image in record["images"]:
-                        stat = Path(image["path"]).stat()
-                        image_stats[image["path"]] = [stat.st_size, stat.st_mtime_ns]
-                except Exception as exc:
-                    errors.append({"source": source["name"], "line": line, "error": str(exc)})
-        except Exception as exc:
-            errors.append({"source": source["name"], "error": str(exc)})
-        if not counts[source["name"]]:
-            errors.append({"source": source["name"], "error": "Source produced no valid training records"})
-    output = Path(config.prepared_dir)
-    output.mkdir(parents=True, exist_ok=True)
-    json_write(output / "validation_errors.json", errors)
-    if errors or not records:
-        raise ValueError(f"Preparation failed: {len(errors)} errors; see {output / 'validation_errors.json'}")
-    cache = output / "records.jsonl"
-    temporary = cache.with_suffix(".tmp")
-    with temporary.open("w", encoding="utf-8", newline="\n") as handle:
-        for record in records:
-            handle.write(json.dumps(record, ensure_ascii=False) + "\n")
-    temporary.replace(cache)
-    lengths = sorted(r["length"] for r in records)
-    manifest = {"version": CACHE_VERSION, "stage": "sft1_warmup", "source_info": source_info,
-                "source_counts": counts, "records_sha256": file_hash(cache),
-                "checkpoint_metadata": inventory["metadata"], "image_stats": image_stats,
-                "process_settings": processor_settings(config), "processor_identity": _processor_identity(processor),
-                "max_seq_length": config.max_seq_length, "interaction_tokens": config.interaction_tokens,
-                "samples": len(records),
-                "helper_segments": sum(len(r["segments"]) for r in records),
-                "length_p50": lengths[len(lengths) // 2],
-                "length_p95": lengths[min(len(lengths) - 1, int(len(lengths) * .95))],
-                "length_max": max(lengths)}
-    json_write(output / "manifest.json", manifest)
-    return manifest
+    # Lazy import keeps the record-level helpers usable in spawned workers.
+    from .preprocessing import prepare_dataset as prepare
+    return prepare(config)
 
 
 class WarmupDataset:
@@ -425,6 +441,11 @@ class WarmupDataset:
     def validate_sources(self, config):
         if self.manifest.get("interaction_tokens") != config.interaction_tokens:
             raise ValueError("Interaction token count changed; run prepare again")
+        if (self.manifest.get("image_policy") != IMAGE_POLICY
+                or self.manifest.get("shrink_overlong_images") != config.shrink_overlong_images):
+            raise ValueError("Image resize policy changed; run prepare again")
+        if self.manifest.get("skip_overlong_samples") != config.skip_overlong_samples:
+            raise ValueError("Overlength exclusion policy changed; run prepare again")
         if _source_inventory(config.sources) != self.manifest["source_info"]:
             raise ValueError("Data sources or field mappings changed; run prepare again")
         if checkpoint_inventory(config.model_path)["metadata"] != self.manifest["checkpoint_metadata"]:
@@ -449,6 +470,28 @@ class WarmupDataset:
         return {**self.records[max(index, 0)], "dummy": index == -1}
 
 
+def encode_image_groups(processor, pictures, pixel_caps):
+    """Preserve occurrence order when different samples use different budgets."""
+    import torch
+    groups = {}
+    for index, cap in enumerate(pixel_caps):
+        groups.setdefault(cap, []).append(index)
+    pixels, grids = [None] * len(pictures), [None] * len(pictures)
+    for cap, indices in groups.items():
+        encoded = image_processor_with_cap(processor, cap)(
+            images=[pictures[index] for index in indices], return_tensors="pt")
+        offset = 0
+        for local, index in enumerate(indices):
+            grid = encoded["image_grid_thw"][local]
+            count = int(grid.prod())
+            pixels[index] = encoded["pixel_values"][offset:offset + count]
+            grids[index] = grid
+            offset += count
+        if offset != len(encoded["pixel_values"]):
+            raise ValueError("Image pixel/grid layout is inconsistent")
+    return {"pixel_values": torch.cat(pixels), "image_grid_thw": torch.stack(grids)}
+
+
 class WarmupCollator:
     def __init__(self, processor, model_config, manifest):
         self.processor, self.config = processor, model_config
@@ -457,7 +500,6 @@ class WarmupCollator:
 
     def __call__(self, records):
         import torch
-        from PIL import Image
         if not records:
             raise ValueError("Cannot collate an empty batch")
         size = max(len(r["input_ids"]) for r in records)
@@ -466,6 +508,7 @@ class WarmupCollator:
         mask = torch.zeros_like(ids, dtype=torch.bool)
         positions = torch.ones(3, len(records), size, dtype=torch.long)
         batch_images, pictures, expected, unique, occurrences = [], [], [], {}, []
+        pixel_caps = []
         feature_offset = 0
         for row, record in enumerate(records):
             length = len(record["input_ids"])
@@ -478,19 +521,21 @@ class WarmupCollator:
             image_row = []
             for item in record["images"]:
                 path, grid = item["path"], item["grid"]
-                if path not in unique:
-                    unique[path] = len(pictures)
-                    with Image.open(path) as image:
-                        pictures.append(image.convert("RGB"))
+                cap = item.get("max_pixels")
+                key = (path, cap)
+                if key not in unique:
+                    unique[key] = len(pictures)
+                    pictures.append(load_training_image(path, self.processor.image_processor))
+                    pixel_caps.append(cap)
                     expected.append(grid)
-                elif expected[unique[path]] != grid:
+                elif expected[unique[key]] != grid:
                     raise ValueError("A repeated image has inconsistent cached grids")
-                occurrences.append(unique[path])
+                occurrences.append(unique[key])
                 count = item["feature_end"] - item["feature_start"]
                 image_row.append({**item, "feature_start": feature_offset, "feature_end": feature_offset + count})
                 feature_offset += count
             batch_images.append(image_row)
-        visual = dict(self.processor.image_processor(images=pictures, return_tensors="pt")) if pictures else {}
+        visual = encode_image_groups(self.processor.image_processor, pictures, pixel_caps) if pictures else {}
         if pictures:
             if visual["image_grid_thw"].tolist() != expected:
                 raise ValueError("Image processor grids changed since preparation")

@@ -18,15 +18,26 @@ python run_sft1.py
 | `gpu_ids` | 如 `[0,1,2,3]`；`null` 保留现有 GPU 可见性设置 |
 | `num_gpus` | 使用的可见 GPU 数量；`null` 使用全部可见 GPU |
 
-默认 CoMT 读取 `thought_rewritten`，答案字段为 `answer`；ReFocus 读取完成裁图的 `sequence_plan`，题目/题图/答案字段为 `question/image/answer`。Visual CoT 读取完成 grounding 的 `train.comt.jsonl`，Zebra 读取 v2 的 `hard_rewritten.jsonl`。默认路径按项目改写脚本的输出目录提供，需按实际文件核对。题图和 helper 必须真实存在；已有绝对图片路径迁移到服务器后需要先修正。
+默认 CoMT 读取 `thought_rewritten`，答案字段为 `original_final_answer`；ReFocus 读取完成裁图的 `sequence_plan`，题目/题图/答案字段为 `question/image/answer`。Visual CoT 读取完成 grounding 的 `train.comt.jsonl`，Zebra 读取 v2 的 `hard_rewritten.jsonl`。CoMT 同时支持 hard 文件和混合的 augmented 文件：`skip_missing_plan: true` 明确排除没有 `thought_rewritten` 的记录，`skip_empty_answer: true` 排除原始答案为空的记录；每条排除记录均写入报告。字段名称配错仍报错，不会用旧 `sequence_plan` 替代改写结果。题图和 helper 必须真实存在；已有绝对图片路径迁移到服务器后需要先修正。
 
-结构化文字使用 `analysis.content` 与 `action.original_text`，不把动作标签或元数据当正文。四个源默认 `require_structured_actions: true`：含 helper 的记录必须有结构化动作，避免误读旧的扁平计划。进入训练的序列末尾必须含 final answer，且与配置的答案字段一致。CoMT、ReFocus 已启用 `allow_append_final_answer: true`：末尾没有答案且没有显式 final 标记时，将原 `answer` 字段追加为末尾文字并计算 CE；已有答案不重复追加，原数据文件不修改。显式 final 标记与答案冲突、缺少可用答案、非法 helper 或演示记录仍报错。Visual CoT、Zebra 默认要求改写计划本身带 final answer。
+结构化文字使用 `analysis.content` 与 `action.original_text`，不把动作标签或元数据当正文。四个源默认 `require_structured_actions: true`：含 helper 的记录必须有结构化动作，避免误读旧的扁平计划。进入训练的序列末尾必须含 final answer，且与配置的答案字段一致。CoMT、ReFocus 已启用 `allow_append_final_answer: true`：末尾没有答案且没有显式 final 标记时，将配置的原始答案字段追加为末尾文字并计算 CE；已有答案不重复追加，原数据文件不修改。显式 final 标记与答案冲突、非法 helper 或演示记录仍报错。Visual CoT、Zebra 默认要求改写计划本身带 final answer。
 
 ## 执行与超参
 
 `mode` 为 `train`、`prepare_only` 或 `smoke`。`prepare_only` 只严格校验并缓存数据，不需要 GPU；`smoke` 使用真实训练流程、默认在 2 个 optimizer steps 后保存，可用 `smoke_steps` 调整。建议 smoke 使用单独 `output_dir`。`max_steps` 是总 optimizer step 上限，`null` 按 `epochs` 完整训练；上限不改变按完整 epoch 规划的学习率曲线。
 
-默认微批 1、梯度累积 2、3 epochs、BF16、ZeRO-1；主干 LR `2e-6`，interaction 与 adapter LR `5e-5`。`adapter_lr: null` 跟随 `fusion_lr`。`min_image_pixels/max_image_pixels` 控制图像处理，`max_seq_length` 是完整交错序列上限；超长记录报错，不截掉答案。启动器先用独立进程准备/核查所有源、图片和权重，再启动多卡进程，避免首次长预处理触发分布式超时；不要绕过入口直接启动训练模块。
+类默认值为微批 1、梯度累积 2、3 epochs、BF16、ZeRO-1；主干 LR `2e-6`，interaction 与 adapter LR `5e-5`，实际以 JSON 为准。`adapter_lr: null` 跟随 `fusion_lr`。`min_image_pixels/max_image_pixels` 控制图像处理，`max_seq_length` 是完整交错序列上限。短边不足 Qwen patch factor（通常 28）的图片按比例放大，原文件不修改。`skip_overlong_samples: true` 默认将超过上限的完整样本排除，源文件、行号、实际长度和上限写入 `skipped_records.jsonl`，不截断文字或答案。`shrink_overlong_images` 默认 `false`，不为超长样本额外降低分辨率。若以后需要保留超长样本并尝试压缩图片，设置 `skip_overlong_samples: false`、`shrink_overlong_images: true`；缩放策略写入缓存并在训练时复用。若两项都为 `false`，超长样本直接报错；启用 skip 时优先排除。
+
+预处理默认 `prepare_workers: 4` 个 CPU 进程，`prepare_log_seconds: 5` 秒输出进度；`prepare_workers: 1` 可串行排查。与训练 DataLoader 的 `num_workers` 独立。任务和待写结果数量有上限，结果按原始源/行号顺序流式写出，不把全量 token 序列留在内存。终端显示完成/总数、成功、排除、错误、降分辨率数量、速度、用时和预计剩余时间。数据准备和所有源/图片/权重核查完成后才启动多卡进程，避免预处理触发分布式超时；不要绕过入口直接启动训练模块。
+
+运行期间可查看 `prepared_dir`：
+
+- `progress.json`：启动即创建，持续更新阶段、全局进度和各数据源统计。
+- `validation_errors.jsonl`：发现错误即追加；`validation_errors.json` 每次进度更新时保存快照。
+- `skipped_records.jsonl`：按配置排除的原始源、行号及原因。
+- `records.partial.jsonl`：持续写入成功结果，定期刷盘；全量通过后才发布为 `records.jsonl` 和 `manifest.json`。
+
+有真实校验错误时仍停止，不将错误记录悄悄丢弃。中断后的 partial 文件可排查，但当前不支持自动从 partial 续跑。`prepare_only` 会重建缓存；成功后改回 `train` 即可复用。
 
 需要 Linux CUDA/BF16 环境、仓库已有的 `requirements-interaction.txt` 依赖和该仓库 Transformers；启动器自动优先加载本仓库 Transformers。`attention_backend` 默认 `flash_attention_2`，无 FlashAttention 环境可改 `sdpa`。
 
@@ -44,7 +55,7 @@ python run_sft1.py
 
 只计算 analysis、action 原文、final answer 和回答结束符的 CE；提示词、全部 interaction token、图像及边界、padding 不计 loss。三个 interaction token 均占用实际序列位置且参与因果注意力。一个样本完整分段前向后才反传；分布式按整个累积窗口的有效文字 token 总数归一化。没有 latent 回归、蒸馏或额外辅助 loss。
 
-interaction token 数量改变后，旧数据缓存必须重建：将 `mode` 设为 `prepare_only` 运行入口，完成后改回 `train`。当前缓存版本为 2，会拒绝旧单 token 缓存；旧单 token 模块检查点也不能直接续训为三个 token。
+interaction token 数量、图片处理策略或超长排除策略改变后，旧数据缓存必须重建：将 `mode` 设为 `prepare_only` 运行入口，完成后改回 `train`。当前缓存版本为 3，会拒绝此前缓存；旧单 token 模块检查点也不能直接续训为三个 token。
 
 ## 保存、续训和后续阶段
 

@@ -287,10 +287,14 @@ class WarmupDataTest(unittest.TestCase):
         path.write_text(json.dumps(self.row) + "\n", encoding="utf-8")
         config = SimpleNamespace(sources=[{**self.source, "path": str(path)}], model_path="fake-model",
                                  prepared_dir=str(self.root / "prepared"), max_seq_length=4096, interaction_tokens=3,
-                                 min_image_pixels=None, max_image_pixels=None)
+                                 min_image_pixels=None, max_image_pixels=None, shrink_overlong_images=True,
+                                 skip_overlong_samples=False,
+                                 prepare_workers=1, prepare_log_seconds=1)
         inventory = {"config": self.model, "metadata": {"test": "fixed"}}
         with mock.patch("src.sft1.data.checkpoint_inventory", return_value=inventory), \
-             mock.patch("src.sft1.data.load_processor", return_value=self.processor):
+             mock.patch("src.sft1.data.load_processor", return_value=self.processor), \
+             mock.patch("src.sft1.preprocessing.checkpoint_inventory", return_value=inventory), \
+             mock.patch("src.sft1.preprocessing.load_processor", return_value=self.processor):
             manifest = prepare_dataset(config)
             self.assertEqual(manifest["samples"], 1)
             dataset = WarmupDataset(config.prepared_dir)
@@ -299,6 +303,10 @@ class WarmupDataTest(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "Interaction token count"):
                 dataset.validate_sources(config)
             config.interaction_tokens = 3
+            config.skip_overlong_samples = True
+            with self.assertRaisesRegex(ValueError, "Overlength exclusion policy"):
+                dataset.validate_sources(config)
+            config.skip_overlong_samples = False
             self.assertTrue(dataset[-1]["dummy"])
             self.assertFalse(dataset[0]["dummy"])
             config.max_image_pixels = 4096
