@@ -148,8 +148,12 @@ class OrderedGradientReduction:
         self.completed_backwards += 1
 
 
-def install_ordered_zero2(engine):
-    """Install once after DS initialize (also on a fresh engine before resume)."""
+def install_ordered_zero2(engine, parameter_order=None):
+    """Install after DS initialize; optional ordering retains all native checks.
+
+    The default is unchanged for SFT-I. A later stage with an auxiliary decoder
+    may prioritize that decoder without holding all of its gradients in memory.
+    """
     if int(engine.zero_optimization_stage()) != 2:
         return None
     if hasattr(engine, "_sft1_ordered_zero2"):
@@ -169,7 +173,7 @@ def install_ordered_zero2(engine):
                               ("independent_gradient_partition_epilogue", ())):
         if tuple(inspect.signature(getattr(optimizer, method)).parameters) != arguments:
             raise RuntimeError(f"DeepSpeed's {method} API changed; revalidate the ordered ZeRO-2 adapter")
-    entries = ordered_parameters(engine.module, optimizer.bit16_groups)
+    entries = (parameter_order or ordered_parameters)(engine.module, optimizer.bit16_groups)
     if any(getattr(param, "use_muon", False) for _, param, _ in entries):
         raise RuntimeError("SFT-I ordered ZeRO-2 does not support Muon parameter transforms")
     if len({param.dtype for _, param, _ in entries}) != 1:

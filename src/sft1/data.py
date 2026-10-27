@@ -453,7 +453,7 @@ class WarmupDataset:
         if not self.records or len(self.records) != self.manifest["samples"]:
             raise ValueError("Prepared sample count differs from manifest")
 
-    def validate_sources(self, config):
+    def validate_sources(self, config, processor=None):
         if self.manifest.get("interaction_tokens") != config.interaction_tokens:
             raise ValueError("Interaction token count changed; run prepare again")
         if (self.manifest.get("image_policy") != IMAGE_POLICY
@@ -469,7 +469,7 @@ class WarmupDataset:
             raise ValueError("Checkpoint/processor metadata changed; run prepare again")
         if processor_settings(config) != self.manifest["process_settings"]:
             raise ValueError("Image pixel limits changed; run prepare again")
-        if _processor_identity(load_processor(config)) != self.manifest["processor_identity"]:
+        if _processor_identity(processor if processor is not None else load_processor(config)) != self.manifest["processor_identity"]:
             raise ValueError("Processor behavior changed; run prepare again")
         if self.manifest["length_max"] > config.max_seq_length:
             raise ValueError("Prepared trajectory exceeds max_seq_length; truncation is forbidden")

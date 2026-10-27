@@ -1,5 +1,7 @@
 # [ACL'26 Oral] ILVR: Interleaved Latent Visual Reasoning with Selective Perceptual Modeling
 
+**SFT-II continuation from warm-up:** See [第二阶段训练指南](docs/sft2_training_zh.md) for the single stream of 4 action latents, 3 helper-conditioned interaction tokens and 16 visual latents with supervised latent start/end boundaries, four training losses, offline teacher targets, and complete checkpoint resume. Set the stage-I export and data paths in `configs/sft2/latent.json`, then run `python run_sft2.py`.
+
 **Zebra-CoT evaluation:** See [Jigsaw / Visual Search 数据准备与评测](docs/zebra_evaluation_zh.md) for individual Parquet shards or full downloads, shared baseline/Interaction evaluation, rule scoring, and optional offline judge scoring.
 
 **Interaction-CE continuation (new):** See [中文训练与数据准备指南](docs/interaction_training_zh.md) for frozen online reference, round-trip fusion, DeepSpeed ZeRO-2/3, checkpoint resume, inference export, and the three controlled CoMT experiments. Start with `bash run_interaction_training.sh configs/interaction/interaction_ce.json` after preparing the data and checkpoint.

@@ -1,0 +1,17 @@
+{
+  "bf16": {"enabled": true},
+  "communication_data_type": "bf16",
+  "zero_optimization": {
+    "stage": 2,
+    "overlap_comm": false,
+    "contiguous_gradients": true,
+    "reduce_scatter": true,
+    "reduce_bucket_size": 20000000,
+    "allgather_bucket_size": 20000000,
+    "ignore_unused_parameters": false
+  },
+  "gradient_clipping": 1.0,
+  "steps_per_print": 1000000,
+  "wall_clock_breakdown": false,
+  "zero_allow_untested_optimizer": true
+}
