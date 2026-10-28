@@ -78,7 +78,7 @@
   "seed": 42,
   "save_steps": 100,
   "log_steps": 1,
-  "max_steps": null,
+  "max_steps": 5600,
   "smoke_steps": 2,
-  "resume": null
+  "resume": "/home/fit/renjujty/WORK/jty/ilvr-train/ILVR/outputs/sft1_warmup/checkpoints/global_step00005600/"
 }
