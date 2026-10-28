@@ -47,7 +47,7 @@
   "deepspeed": "configs/sft2/zero2.json",
   "gpu_ids": null,
   "num_gpus": null,
-  "epochs": 1.5,
+  "epochs": 2,
   "micro_batch_size": 1,
   "gradient_accumulation_steps": 8,
   "backbone_lr": 1e-05,
