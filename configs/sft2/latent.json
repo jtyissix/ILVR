@@ -1,6 +1,6 @@
 {
   "mode": "train",
-  "warmup_path": "/home/fit/renjujty/jty/ilvr-train/ILVR/outputs/sft1_warmup/checkpoints/global_step00005600/",
+  "warmup_path": "/home/fit/renjujty/WORK/jty/ilvr-train/ILVR/outputs/sft1_warmup/export/",
   "sources": [
     {
       "name": "comt",
