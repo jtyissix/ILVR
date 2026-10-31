@@ -1,21 +1,70 @@
 """Instance-local ordered ZeRO-2 adapter for optimizer CPU offload.
 
 The original SFT-I/SFT-II adapter intentionally supports GPU optimizer state
-only. This opt-in adapter retains native CPU partition copies, clipping, Adam
-updates and epilogues, and fixes DeepSpeed 0.18.0's missing intermediate CPU
-accumulation writeback. No installed DeepSpeed file or original trainer changes.
+only. This opt-in adapter retains native CPU partition copies, Adam updates and
+epilogues, fixes intermediate accumulation writeback, and uses FP64 norms for
+clipping. No installed DeepSpeed file or original trainer changes.
 """
 from __future__ import annotations
 
 import hashlib
 import inspect
 import json
+import math
 
 import torch
 import torch.distributed as dist
 
 from ..sft1.zero2 import OrderedGradientReduction, check_zero2_version
 from ..sft2.train import ordered_parameters
+
+
+def offload_group_norm(optimizer, params):
+    """Retain FP64 through squaring, DP reduction and the returned norm.
+
+    Native 0.18.0 casts squared norms to FP32 and replaces Inf/NaN with -1.
+    The subsequent group norm hides that sentinel. Never do either here.
+    This adapter already excludes pipeline/model/expert parallel training.
+    """
+    device = optimizer.bit16_groups[0][0].device
+    values = []
+    for param in params:
+        if getattr(param, "ds_pipe_replicated", False):
+            continue
+        value = optimizer.norm_for_param_grads.get(optimizer.get_param_id(param))
+        if value is None:
+            if not optimizer.ignore_unused_parameters:
+                # Propagate a missing norm through the collective before failing
+                # so one rank cannot leave its peers waiting in this reduction.
+                values.append(torch.tensor(float("nan"), device=device, dtype=torch.float64))
+        else:
+            values.append(value.detach().to(device=device, dtype=torch.float64))
+    squared = (torch.stack(values).square().sum() if values else
+               torch.zeros((), device=device, dtype=torch.float64))
+    if dist.is_initialized():
+        dist.all_reduce(squared, op=dist.ReduceOp.SUM, group=optimizer.dp_process_group)
+    norm = squared.sqrt()
+    if not bool(torch.isfinite(norm)):
+        guard = getattr(optimizer, "_sft2_numerics", None)
+        if guard is not None:
+            guard.check("gradient_norm", {"group_norm": norm})
+        raise FloatingPointError("Non-finite CPU offload gradient norm; optimizer update aborted")
+    # Native clipping multiplies CPU FP32 gradient partitions by this scalar.
+    return norm.to(device=optimizer.device)
+
+
+def offload_clip(optimizer, grad_groups_flat, total_norm):
+    """Use a Python FP64 reciprocal, avoiding a CPU/GPU scalar mismatch."""
+    norm = float(total_norm)
+    scale = float(optimizer.loss_scale)
+    if not math.isfinite(norm) or norm < 0 or not math.isfinite(scale) or scale <= 0:
+        raise FloatingPointError("Invalid offload clipping norm/scale; optimizer update aborted")
+    combined = scale
+    if optimizer.clip_grad > 0:
+        combined *= max((norm / scale + 1e-6) / optimizer.clip_grad, 1.0)
+    for group in grad_groups_flat:
+        for grad in (group if isinstance(group, list) else [group]):
+            grad.data.mul_(1.0 / combined)
 
 
 def persist_offload_accumulation(optimizer, param):
@@ -76,6 +125,8 @@ def install_ordered_offload(engine):
     for name, arguments in (
             ("reduce_ready_partitions_and_remove_grads", ("param", "i")),
             ("independent_gradient_partition_epilogue", ()),
+            ("complete_grad_norm_calculation_for_cpu_offload", ("params",)),
+            ("unscale_and_clip_grads", ("grad_groups_flat", "total_norm")),
             ("async_accumulate_grad_in_cpu_via_gpu", ("param",))):
         if tuple(inspect.signature(getattr(optimizer, name)).parameters) != arguments:
             raise RuntimeError(f"DeepSpeed's {name} API changed; revalidate SFT-II CPU offload")
@@ -109,10 +160,28 @@ def install_ordered_offload(engine):
     native_backward = engine.backward
     native_epilogue = optimizer.independent_gradient_partition_epilogue
     native_accumulate = optimizer.async_accumulate_grad_in_cpu_via_gpu
+    native_copy = optimizer.copy_grads_in_partition
+    names = {id(param): name for name, param, _ in entries}
+
+    def observe(param, stage):
+        guard = getattr(optimizer, "_sft2_numerics", None)
+        gradient = optimizer.get_param_gradient_attribute(param)
+        if guard is not None and gradient is not None:
+            guard.observe_gradient(stage, names[id(param)], gradient)
 
     def accumulate(param):
         native_accumulate(param)
         persist_offload_accumulation(optimizer, param)
+        observe(param, "accumulated_gradient")
+
+    def copy_partition(param):
+        if optimizer.gradient_accumulation_steps == 1:
+            observe(param, "partition_gradient")
+        return native_copy(param)
+
+    def ready(param, group):
+        observe(param, "raw_gradient")
+        return reducer.ready(param, group)
 
     def epilogue():
         reducer.finish()
@@ -130,7 +199,11 @@ def install_ordered_offload(engine):
         return result
 
     optimizer.async_accumulate_grad_in_cpu_via_gpu = accumulate
-    optimizer.reduce_ready_partitions_and_remove_grads = reducer.ready
+    optimizer.copy_grads_in_partition = copy_partition
+    optimizer.complete_grad_norm_calculation_for_cpu_offload = lambda params: offload_group_norm(optimizer, params)
+    optimizer.unscale_and_clip_grads = lambda grad_groups_flat, total_norm: offload_clip(
+        optimizer, grad_groups_flat, total_norm)
+    optimizer.reduce_ready_partitions_and_remove_grads = ready
     optimizer.independent_gradient_partition_epilogue = epilogue
     engine.backward = backward
     engine._sft2_offload_ordered_zero2 = reducer

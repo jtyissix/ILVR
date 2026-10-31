@@ -187,6 +187,8 @@ class OffloadLaunchAndCacheTest(unittest.TestCase):
                              torch.optim.AdamW(training.optimizer_groups(student, config))),
                 patch.object(training, "install_ordered_offload", return_value=SimpleNamespace(
                              order_sha256="fixture-order", peak_pending_bytes=0)),
+                # This loop fixture uses ordinary AdamW in place of ZeRO.
+                patch.object(training.NumericalGuard, "check_state"),
                 patch.object(training, "resume_signature", return_value="fixture-signature"),
                 patch.object(training, "DataLoader", return_value=batches),
                 patch.object(training, "encode_images", side_effect=lambda visual, batch: batch["fixture_features"]),

@@ -74,12 +74,29 @@ batch 内序列补齐到最长长度，多数 decoder 张量按 `B × T_max` 分
 
 先使用默认 batch=1 验证多个完整更新，再在独立输出目录尝试 batch=2。`mode: "smoke"`、`smoke_steps: 3` 可检查启动、累积和 checkpoint；默认 smoke 只覆盖头几个窗口，不代表最长样本通过。要验证容量，还需覆盖最长序列、多 action 和大图片样本。不同 batch/GAS/world_size 的 checkpoint 不可直接互相 resume。
 
+## 数值保护与复现日志
+
+offload 入口默认启用保护，无需修改训练 JSON。梯度范数的平方、跨卡求和及各参数组汇总保留 FP64，消除 DeepSpeed 0.18.0 原 offload 范数路径的 FP32 溢出及 -1 哨兵问题。裁剪阈值仍取原配置（默认 1.0），四项 loss、权重、学习率、seed、interaction 和梯度累积方式不变。
+
+每个 microbatch 在输入、前向及反向结束处进行跨 rank 有限值检查。梯度记录包括归约前参数梯度，以及 CPU offload 复制前的累计梯度；最后一个 microbatch 还检查实际 CPU FP32 梯度分片。启动/恢复时检查权重和已有 Adam 状态，每次更新后再次检查主权重、Adam 状态及 BF16 模型权重。任一卡检测到 NaN/Inf，各卡同步报错退出，不跳过坏 batch、不替换 NaN、不保存此次异常 checkpoint。更新后才发现异常时，无法回滚该次更新，但会阻止继续训练和保存。
+
+输出目录内新增：
+
+- `numerics/rank-00000.jsonl` 等：每卡逐 microbatch 日志，含 update（从 1 开始）、epoch/window/microbatch（从 0 开始）、样本 record ID、原始 source/line、当前累积窗口的样本 ID、长度、action/helper 数量、原始 loss sum、归一化后组合 loss、学习率。
+- 同一日志记录 action/visual 输入 latent、action 最后槽位输出、interaction、helper target 的 L2 范数范围，以及 teacher 向量均方能量（排除 padding，epsilon clamp 之前）。梯度记录各阶段绝对值最大的 5 个参数及所有异常参数中的前 32 个名称。
+- `numerics/failure-*-rank-*.json`：异常时每卡分别保存。即使本卡数值正常，也记录远端异常导致的退出。结合前一个 forward/backward 记录定位最早出现异常的阶段。
+- `metrics.jsonl` 增加 `grad_norm_before_clip`；每次 after_update 诊断记录裁剪阈值和乘数。
+
+日志仅保存脱离计算图的统计量和样本定位信息，不保存大张量；检查会额外扫描梯度/状态并进行同步，实际耗时需在 7B 训练时测量。保护不保证复现原崩溃，因为正确裁剪本身可能消除触发条件。
+
+保持原参数和原 seed 重新训练即可。重新开始第二阶段时保持 `resume: null`，复用原 warmup checkpoint、prepared 和 teacher 路径；本修复不改变缓存 identity。建议使用新的 output_dir 区分复现实验。若从旧 checkpoint 恢复，启动检查会拒绝非有限权重或 Adam 状态，但“有限”并不证明 checkpoint 未经异常大梯度更新。
+
 ## 验证范围
 
 CPU 单元测试：
 
 ```bash
-python -m unittest tests.test_sft2_offload
+python -m unittest tests.test_sft2_offload tests.test_sft2_offload_numerics
 ```
 
 真实多卡 CPUAdam 验收：

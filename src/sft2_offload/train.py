@@ -20,6 +20,7 @@ from ..sft2.checkpoint import export_stage2, load_training, resume_signature, sa
 from ..sft2.train import LOSS_NAMES, combined_loss, loss_weights, optimizer_groups, to_device
 from .config import DEFAULT_CONFIG, Stage2Config, configure_deepspeed, validate_local_inputs
 from .zero2 import install_ordered_offload
+from .numerics import NumericalGuard
 
 
 def create_optimizer(student, config):
@@ -104,6 +105,11 @@ def train(config):
     epoch_start, start_window = 0, 0
     if config.resume:
         epoch_start, start_window = load_training(engine, config.resume, signature, source, teacher_hash)
+    numerics = NumericalGuard(output, device)
+    engine.optimizer._sft2_numerics = numerics
+    numerics.install_trajectory(student)
+    numerics.context = {"stage": "startup", "resume": config.resume, "seed": config.seed}
+    numerics.check_state(engine.optimizer, "startup")
     if not (0 <= epoch_start <= config.epochs and 0 <= start_window < total_windows):
         raise ValueError("Checkpoint epoch/window is outside this dataset's training schedule")
     weights = loss_weights(config)
@@ -114,6 +120,8 @@ def train(config):
             "gradient_order_sha256": reducer.order_sha256 if reducer else None,
             "gradient_reduction": "ordered_auxiliary_then_student_cpu_offload",
             "optimizer_offload": "cpu", "optimizer": "DeepSpeedCPUAdam",
+            "numerical_protection": "fp64_offload_norm_and_synchronized_finite_checks_v1",
+            "numerical_logs": str(output / "numerics"),
             "memory_budget": memory_budget(student, visual),
             "effective_batch": world() * config.micro_batch_size * config.gradient_accumulation_steps,
             "total_optimizer_steps": total_steps, "step_limit": config.step_limit,
@@ -151,17 +159,28 @@ def train(config):
             local_losses = {name: torch.zeros((), device=device, dtype=torch.float32) for name in LOSS_NAMES}
             torch.cuda.reset_peak_memory_stats()
             before_step, pending_peak_bytes = engine.global_steps, 0
-            for cpu_batch in window:
+            window_records = [item.get("record_ids", []) for item in window]
+            for microbatch, cpu_batch in enumerate(window):
+                numerics.begin(before_step + 1, epoch, window_index, microbatch,
+                               cpu_batch, window_records)
                 batch = to_device(cpu_batch, device)
                 features = encode_images(visual, batch)
+                numerics.inputs(batch, features)
                 losses = engine(batch, image_features=features)
                 for name in LOSS_NAMES:
                     local_losses[name] += losses[name].detach().float()
                 loss = combined_loss(losses, counts, weights, config.gradient_accumulation_steps, world())
+                numerics.check("forward", {**losses, "combined_loss": loss},
+                               extra={"global_loss_counts": counts, "lr": scheduler.get_last_lr()})
                 engine.backward(loss)
+                numerics.check("backward", gradients=True)
                 if reducer:
                     pending_peak_bytes = max(pending_peak_bytes, reducer.peak_pending_bytes)
+                if microbatch == config.gradient_accumulation_steps - 1:
+                    numerics.check_state(engine.optimizer, "before_update")
                 engine.step()
+                if microbatch == config.gradient_accumulation_steps - 1:
+                    numerics.check_state(engine.optimizer, "after_update")
                 del losses, loss, features, batch
             if engine.global_steps != before_step + 1:
                 raise RuntimeError("DeepSpeed accumulation did not produce one optimizer step per window")
@@ -183,6 +202,9 @@ def train(config):
                           "loss_counts": counts, "samples": samples, "samples_per_second": samples / seconds,
                           "step_seconds": seconds, "data_seconds": data_seconds, "peak_allocated_gib": peak_gib,
                           "zero2_pending_grad_peak_gib": pending_peak_gib, "lr": scheduler.get_last_lr()}
+                grad_norm = getattr(engine.optimizer, "_global_grad_norm", None)
+                if grad_norm is not None:
+                    record["grad_norm_before_clip"] = float(grad_norm)
                 print(json.dumps(record), flush=True)
                 with (output / "metrics.jsonl").open("a", encoding="utf-8") as handle:
                     handle.write(json.dumps(record) + "\n")

@@ -77,6 +77,11 @@ def initialize(config, device, cpu_test_optimizer, bf16=False):
     for master in engine.optimizer.single_partition_of_fp32_groups:
         if master.device.type != "cpu" or master.grad.device.type != "cpu":
             raise AssertionError("FP32 master and gradient partitions must reside on CPU")
+    from src.sft2_offload.numerics import NumericalGuard
+    guard = NumericalGuard(tempfile.mkdtemp(prefix="sft2-offload-numerics-"), device)
+    engine.optimizer._sft2_numerics = guard
+    guard.install_trajectory(engine.module)
+    guard.check_state(engine.optimizer, "startup")
     engine.train()
     return engine
 
@@ -95,19 +100,27 @@ def distributed_update(engine, config, world_size, rank_id, window, device):
     handles = [p.register_hook(lambda grad, name=name: ready.append(name))
                for name, p in engine.module.named_parameters() if p.requires_grad]
     initial, gradients = engine.global_steps, {}
+    guard = engine.optimizer._sft2_numerics
     for microstep, (batch, features) in enumerate(local):
         ready.clear()
         dtype = next(engine.module.parameters()).dtype
-        losses = engine(to_device(batch, device), None if features is None else features.to(device=device, dtype=dtype))
+        guard.begin(initial + 1, 0, window, microstep, batch, [])
+        batch = to_device(batch, device)
+        features = None if features is None else features.to(device=device, dtype=dtype)
+        guard.inputs(batch, features)
+        losses = engine(batch, features)
+        guard.check("forward", losses)
         for name in LOSS_NAMES:
             totals[name] += float(losses[name].detach())
         engine.backward(combined_loss(losses, counts, loss_weights(config), ACCUMULATION, world_size))
+        guard.check("backward", gradients=True)
         if len(ready) != len(names) or set(ready) != names:
             raise AssertionError("Every trainable leaf must be ready exactly once, including empty branches")
         gathered = [None] * world_size
         dist.all_gather_object(gathered, tuple(ready))
         orders.append(len(set(gathered)))
         if microstep == ACCUMULATION - 1:
+            guard.check_state(engine.optimizer, "before_update")
             for name, parameter in engine.module.named_parameters():
                 if parameter.requires_grad:
                     gradient = safe_get_full_grad(parameter)
@@ -115,6 +128,8 @@ def distributed_update(engine, config, world_size, rank_id, window, device):
                         raise AssertionError(f"Missing or nonfinite offloaded gradient: {name}")
                     gradients[name] = gradient.detach().clone()
         engine.step()
+        if microstep == ACCUMULATION - 1:
+            guard.check_state(engine.optimizer, "after_update")
         if engine.global_steps != initial + int(microstep == ACCUMULATION - 1):
             raise AssertionError("Wrong optimizer accumulation boundary")
     for handle in handles:
