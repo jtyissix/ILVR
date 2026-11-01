@@ -87,5 +87,5 @@
   "log_steps": 1,
   "max_steps": null,
   "smoke_steps": 2,
-  "resume": null
+  "resume": "/home/fit/renjujty/WORK/jty/ilvr-train/ILVR/outputs/sft2_offload/checkpoints/global_step00000300/"
 }
