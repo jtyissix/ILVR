@@ -66,6 +66,23 @@ This project uses HuggingFace `accelerate` for distributed training. Please conf
 accelerate config
 ```
 
+### 3. Benchmark Evaluation
+
+The evaluation scripts are in [`eval/`](eval/README.md). From the ILVR project root,
+reuse the existing `ilvr` environment and install only the additional dependencies:
+
+```bash
+python -m pip install -r requirements-eval.txt
+# Edit the globals at the top of each script before running.
+python eval/download.py
+python eval/evaluate.py
+```
+
+Keep the existing Torch and custom Transformers installations. The incremental
+requirements use ANTLR 4.11.1 for MM-Math; the legacy EMMA fast scorer in
+`requirements-emma.txt` requires 4.7.2 and needs a separate scoring environment
+if it is still used. See [`eval/README.md`](eval/README.md) for configuration and results.
+
 ---
 
 ## 📚 Data Preparation

@@ -6,3 +6,12 @@
 /configs/deepseek_api.json
 __pycache__/
 *.pyc
+
+# Python tooling caches (including evaluation tests).
+.pytest_cache/
+.ruff_cache/
+
+# Evaluation downloads, prepared datasets, predictions and judge responses.
+# Keep evaluation source, tests, requirements and vendored reference code tracked.
+/eval/datasets/
+/eval/outputs/

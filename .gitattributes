@@ -1,0 +1,3 @@
+# Normalize evaluation source across Windows/Linux checkouts.
+/eval/** text=auto eol=lf
+/requirements-eval.txt text eol=lf

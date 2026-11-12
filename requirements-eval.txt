@@ -1,0 +1,15 @@
+# Incremental evaluation dependencies for the existing ILVR environment.
+# Run from the ILVR project root:
+#   python -m pip install -r requirements-eval.txt
+# Reuse ILVR's torch / torchvision / transformers fork / qwen-vl-utils.
+# Do not install eval/requirements.txt into the training environment.
+
+# MathVista: official answer normalization (edit distance).
+python-Levenshtein>=0.25,<0.28
+
+# MM-Math: SymPy's official LaTeX parser.
+# CONFLICT: requirements-emma.txt pins antlr4-python3-runtime==4.7.2 for
+# latex2sympy2's legacy EMMA fast scorer. This file upgrades it to 4.11.1.
+# If the legacy fast scorer is still needed, use a separate scoring environment.
+# The new eval/ EMMA path uses an API judge and does not require latex2sympy2.
+antlr4-python3-runtime==4.11.1

@@ -1,0 +1,11 @@
+-r requirements-data.txt
+# Use a separate evaluation environment; do not replace the training fork in-place.
+torch>=2.6,<2.8
+torchvision>=0.21,<0.23
+transformers==4.51.3
+accelerate>=1.2,<2
+safetensors>=0.4
+qwen-vl-utils==0.0.11
+sympy>=1.13,<1.15
+antlr4-python3-runtime==4.11.1
+python-Levenshtein>=0.25

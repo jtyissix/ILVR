@@ -1,0 +1,67 @@
+{
+  "mm_math_eval.py": {
+    "repo": "kge-sun/MM-Math",
+    "revision": "a8072fcfbc8bf0ef41912e4aea9d4b4ee9e914e9",
+    "path": "eval.py"
+  },
+  "mathvista_prompt.py": {
+    "repo": "lupantech/MathVista",
+    "revision": "5f6b4deca69ecd1b8a1a4f338cee085e50524e4b",
+    "path": "evaluation/prompts/ext_ans.py"
+  },
+  "mathvista_score.py": {
+    "repo": "lupantech/MathVista",
+    "revision": "5f6b4deca69ecd1b8a1a4f338cee085e50524e4b",
+    "path": "evaluation/calculate_score.py"
+  },
+  "emma_config.yaml": {
+    "repo": "EMMA-Bench/EMMA",
+    "revision": "47259952dd8e95bc1e3855a4164ccd3634f8eb1e",
+    "path": "configs/gpt.yaml"
+  },
+  "emma_utils.py": {
+    "repo": "EMMA-Bench/EMMA",
+    "revision": "47259952dd8e95bc1e3855a4164ccd3634f8eb1e",
+    "path": "evaluation/utils.py"
+  },
+  "visualpuzzles_utils.py": {
+    "repo": "neulab/VisualPuzzles",
+    "revision": "ee212f97864bde4f0b662acca8ec14534e2ce9a7",
+    "path": "lmms-eval/lmms_eval/tasks/VisualPuzzles/utils.py"
+  },
+  "blink_mcq.py": {
+    "repo": "zeyofu/BLINK_Benchmark",
+    "revision": "529b0ba055416dea5df79d594e7f62a910d8a308",
+    "path": "eval/multiple_choice.py"
+  },
+  "blink_test.py": {
+    "repo": "zeyofu/BLINK_Benchmark",
+    "revision": "63137e4e831d334c12635334035033032ddf0631",
+    "path": "eval/test_benchmark.py"
+  },
+  "visulogic_prompts.py": {
+    "repo": "VisuLogic-Benchmark/VisuLogic-Eval",
+    "revision": "00fba6ddafdc0d6805a4b9455c8df36502aeda2a",
+    "path": "models/prompts.py"
+  },
+  "visulogic_eval.py": {
+    "repo": "VisuLogic-Benchmark/VisuLogic-Eval",
+    "revision": "00fba6ddafdc0d6805a4b9455c8df36502aeda2a",
+    "path": "evaluation/eval_model.py"
+  },
+  "mmstar_score.py": {
+    "repo": "MMStar-Benchmark/MMStar",
+    "revision": "88f243ab4a39cb339530085c33aecb22819881a1",
+    "path": "eval/vlmeval/evaluate/mmstar.py"
+  },
+  "scienceqa_run.py": {
+    "repo": "lupantech/ScienceQA",
+    "revision": "360b71cb6a36b9e3161dc9b65e9d86458b7d13a3",
+    "path": "models/run_gpt3.py"
+  },
+  "scienceqa_prompt.py": {
+    "repo": "lupantech/ScienceQA",
+    "revision": "360b71cb6a36b9e3161dc9b65e9d86458b7d13a3",
+    "path": "models/base_prompt.py"
+  }
+}
