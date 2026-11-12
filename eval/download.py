@@ -7,7 +7,7 @@ if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 # ===================== 只修改此配置区 =====================
-DATASET_DIR = str(Path(__file__).resolve().parent / "datasets")
+DATASET_DIR = "/home/fit/renju/WORK/jty/dataset/lm-eval/"
 ONLY_DATASETS = ["all"]      # 例如 ['mmvp', 'hrbench', 'mathvista']；hrbench 展开为 4K + 8K
 EXCLUDE_DATASETS = []        # 和 ONLY_DATASETS 必须恰好一个非空
 HF_ENDPOINT = os.environ.get("HF_ENDPOINT", "https://hf-mirror.com")
