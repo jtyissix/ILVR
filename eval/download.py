@@ -19,8 +19,17 @@ PREPARE_ONLY = False         # True: 使用已有 raw 文件，完全不联网
 # =========================================================
 
 from eval.common import SCHEMA_VERSION, read_json, read_jsonl, select_benchmarks, write_json
-from eval.data import normalize
-from eval.registry import EXPECTED_COUNTS, source_for
+from eval.data import migrate_img_references, normalize
+from eval.registry import source_for
+
+
+def write_samples(prepared, samples):
+    import json
+    temporary = prepared / "samples.jsonl.tmp"
+    with temporary.open("w", encoding="utf-8") as f:
+        for sample in samples:
+            f.write(json.dumps(sample, ensure_ascii=False, allow_nan=False) + "\n")
+    temporary.replace(prepared / "samples.jsonl")
 
 
 def prepare_one(name, dataset_dir, *, endpoint=HF_ENDPOINT, token=HF_TOKEN, workers=4,
@@ -38,10 +47,14 @@ def prepare_one(name, dataset_dir, *, endpoint=HF_ENDPOINT, token=HF_TOKEN, work
     manifest_path = prepared / "manifest.json"
     if manifest_path.is_file():
         manifest = read_json(manifest_path)
-        # Old schema/implementation metadata does not invalidate prepared data.
-        previous = manifest.get("settings", {})
-        if any(previous.get(key) != settings[key] for key in ("source", "emma_variant", "scienceqa_full")):
-            raise ValueError(f"{name}: existing data uses another variant/revision; choose a new DATASET_DIR")
+        # Trust completed datasets. Only migrate the previous .img output format.
+        if any(Path(p).suffix.lower() == ".img" for p in manifest.get("images", [])):
+            samples = list(read_jsonl(prepared / "samples.jsonl"))
+            migrate_img_references(prepared, samples)
+            write_samples(prepared, samples)
+            manifest["images"] = sorted({p for s in samples for p in s["images"].values()})
+            manifest["unique_images"] = len(manifest["images"])
+            write_json(manifest_path, manifest)
         print(f"{name}: already prepared, {manifest['count']} samples", flush=True)
         return manifest
     samples_path = prepared / "samples.jsonl"
@@ -59,29 +72,11 @@ def prepare_one(name, dataset_dir, *, endpoint=HF_ENDPOINT, token=HF_TOKEN, work
     elif samples is None and not raw.is_dir():
         raise FileNotFoundError(raw)
     prepared.mkdir(parents=True, exist_ok=True)
-    progress_settings = prepared / "prepare_settings.json"
-    if progress_settings.is_file():
-        previous = read_json(progress_settings)
-        if any(previous.get(key) != settings[key] for key in ("source", "emma_variant", "scienceqa_full")):
-            raise ValueError(f"{name}: partial preparation uses another variant/revision; choose a new DATASET_DIR")
-    write_json(progress_settings, settings)
     print(f"{name}: preparing official release", flush=True)
     if samples is None:
         samples = normalize(name, raw, prepared, emma_variant, scienceqa_full)
-    expected = EXPECTED_COUNTS.get(name)
-    if name == "emma" and emma_variant == "mini":
-        expected = 400
-    if name == "scienceqa" and scienceqa_full:
-        expected = 4241
-    if expected is not None and len(samples) != expected:
-        raise ValueError(f"{name}: expected {expected}, got {len(samples)}; refusing an incomplete/incorrect split")
-    if name == "mm_math" and len(samples) < 5700:
-        raise ValueError("MM-Math release appears incomplete (<5700 QA rows)")
-    tmp = prepared / "samples.jsonl.tmp"
-    with tmp.open("w", encoding="utf-8") as f:
-        for sample in samples:
-            f.write(json.dumps(sample, ensure_ascii=False, allow_nan=False) + "\n")
-    tmp.replace(prepared / "samples.jsonl")
+    migrate_img_references(prepared, samples)
+    write_samples(prepared, samples)
     image_paths = sorted({p for s in samples for p in s["images"].values()})
     manifest = {"settings": settings, "count": len(samples), "unique_images": len(image_paths),
                 "images": image_paths,

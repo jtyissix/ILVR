@@ -221,16 +221,17 @@ def test_archive_traversal_rejected(tmp_path, entry):
         extract_archive(archive, tmp_path / "out")
 
 
-def test_image_storage_preserves_original_bytes_without_dedup(tmp_path):
+def test_image_storage_converts_png_without_dedup(tmp_path):
     store = ImageStore(tmp_path, tmp_path / "prepared")
     buf = io.BytesIO()
     Image.new("RGBA", (8, 8), (0, 0, 0, 0)).save(buf, "PNG")
     a = store.save(buf.getvalue())
     b = store.save({"bytes": buf.getvalue(), "path": None})
     assert a != b
-    assert (tmp_path / "prepared" / a).read_bytes() == buf.getvalue()
+    assert a.endswith(".png") and b.endswith(".png")
     with Image.open(tmp_path / "prepared" / a) as image:
-        assert image.getpixel((0, 0)) == (0, 0, 0, 0)
+        assert image.format == "PNG"
+        assert image.getpixel((0, 0)) == (255, 255, 255)
 
 
 def write_parquet(path, rows):

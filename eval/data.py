@@ -2,6 +2,7 @@
 import ast
 import base64
 import csv
+import io
 import json
 import re
 import shutil
@@ -9,6 +10,38 @@ import zipfile
 from pathlib import Path
 
 from .common import canonical_json, read_json, read_jsonl, safe_path
+
+
+def save_png(value, target):
+    """Convert once, with fast PNG compression; existing output is trusted."""
+    from PIL import Image, ImageOps
+    target = Path(target)
+    if target.is_file():
+        return
+    source = io.BytesIO(value) if isinstance(value, (bytes, bytearray)) else value
+    target.parent.mkdir(parents=True, exist_ok=True)
+    temporary = target.with_suffix(".png.part")
+    with Image.open(source) as image:
+        image = ImageOps.exif_transpose(image)
+        if image.mode in ("RGBA", "LA", "P"):
+            rgba = image.convert("RGBA")
+            image = Image.new("RGB", rgba.size, "white")
+            image.paste(rgba, mask=rgba.getchannel("A"))
+        else:
+            image = image.convert("RGB")
+        image.save(temporary, format="PNG", compress_level=1, optimize=False)
+    temporary.replace(target)
+
+
+def migrate_img_references(prepared, samples):
+    """Resume the previous .img release by converting its referenced files once."""
+    prepared = Path(prepared)
+    for sample in samples:
+        for key, relative in sample["images"].items():
+            if Path(relative).suffix.lower() == ".img":
+                converted = str(Path(relative).with_suffix(".png")).replace("\\", "/")
+                save_png(safe_path(prepared, relative), safe_path(prepared, converted))
+                sample["images"][key] = converted
 
 
 def extract_archive(path, destination):
@@ -74,33 +107,28 @@ class ImageStore:
         raise FileNotFoundError(f"Missing or ambiguous image: {relative} under {self.raw}")
 
     def save(self, value):
-        """Save original encoded bytes; reuse atomically completed source slots."""
+        """Convert to PNG without verification or content deduplication."""
         if value is None:
             return None
         self.image_count += 1
         # A separate namespace never overwrites older numbered/deduplicated PNGs.
-        relative = f"images/source_{self.image_count:08d}.img"
+        relative = f"images/source_{self.image_count:08d}.png"
         target = self.prepared / relative
         # Stable source traversal makes this a per-image preparation checkpoint.
         # Check BEFORE decoding base64, reading source images or opening PIL.
         if target.is_file():
             return relative
-        if isinstance(value, dict):
+        legacy = target.with_suffix(".img")
+        if legacy.is_file():
+            value = legacy
+        elif isinstance(value, dict):
             value = value.get("bytes") if value.get("bytes") is not None else self.locate(value["path"])
         elif isinstance(value, str):
             if value.startswith("data:") or value.startswith(("iVBOR", "/9j/", "UklGR", "R0lGOD", "Qk")):
                 value = base64.b64decode(value.split(",", 1)[-1] if value.startswith("data:") else value)
             else:
                 value = self.locate(value)
-        target.parent.mkdir(parents=True, exist_ok=True)
-        temporary = target.with_suffix(".img.part")
-        if isinstance(value, (str, Path)):
-            shutil.copyfile(value, temporary)
-        elif isinstance(value, (bytes, bytearray)):
-            temporary.write_bytes(value)
-        else:
-            raise TypeError(f"Unsupported official image representation: {type(value)}")
-        temporary.replace(target)
+        save_png(value, target)
         if self.image_count == 1 or self.image_count % 100 == 0:
             print(f"{self.prepared.parent.name}: prepared {self.image_count} image slots", flush=True)
         return relative

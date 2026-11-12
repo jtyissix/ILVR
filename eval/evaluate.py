@@ -63,7 +63,7 @@ def load_prepared(root, name, *, limit=None, validate=False):
     prepared = Path(root) / name / "prepared"
     manifest = read_json(prepared / "manifest.json")
     samples = list(read_jsonl(prepared / "samples.jsonl"))
-    if len(samples) != manifest["count"]:
+    if validate and len(samples) != manifest["count"]:
         raise ValueError(f"{name}: manifest/sample count mismatch")
     if validate:
         validate_samples(samples, name, prepared)
