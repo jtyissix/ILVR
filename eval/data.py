@@ -2,7 +2,6 @@
 import ast
 import base64
 import csv
-import io
 import json
 import re
 import shutil
@@ -24,6 +23,8 @@ def extract_archive(path, destination):
             target = safe_path(destination, name)
             if info.is_dir():
                 target.mkdir(parents=True, exist_ok=True)
+                continue
+            if target.is_file():
                 continue
             target.parent.mkdir(parents=True, exist_ok=True)
             tmp = target.with_name(target.name + ".part")
@@ -47,7 +48,6 @@ class ImageStore:
     def __init__(self, raw, prepared):
         self.raw, self.prepared = Path(raw), Path(prepared)
         self.by_name = None
-        self.by_size = {}
         self.image_count = 0
 
     def locate(self, relative):
@@ -74,46 +74,35 @@ class ImageStore:
         raise FileNotFoundError(f"Missing or ambiguous image: {relative} under {self.raw}")
 
     def save(self, value):
-        from PIL import Image, ImageOps
+        """Save original encoded bytes; reuse atomically completed source slots."""
         if value is None:
             return None
+        self.image_count += 1
+        # A separate namespace never overwrites older numbered/deduplicated PNGs.
+        relative = f"images/source_{self.image_count:08d}.img"
+        target = self.prepared / relative
+        # Stable source traversal makes this a per-image preparation checkpoint.
+        # Check BEFORE decoding base64, reading source images or opening PIL.
+        if target.is_file():
+            return relative
         if isinstance(value, dict):
             value = value.get("bytes") if value.get("bytes") is not None else self.locate(value["path"])
         elif isinstance(value, str):
             if value.startswith("data:") or value.startswith(("iVBOR", "/9j/", "UklGR", "R0lGOD", "Qk")):
-                value = base64.b64decode(value.split(",", 1)[-1] if value.startswith("data:") else value, validate=True)
+                value = base64.b64decode(value.split(",", 1)[-1] if value.startswith("data:") else value)
             else:
                 value = self.locate(value)
-        if isinstance(value, (str, Path)):
-            value = Path(value).read_bytes()
-        if not isinstance(value, (bytes, bytearray)):
-            raise TypeError(f"Unsupported official image representation: {type(value)}")
-        with Image.open(io.BytesIO(value)) as image:
-            image = ImageOps.exif_transpose(image)
-            # Match qwen_vl_utils alpha compositing for transparent diagrams.
-            if image.mode in ("RGBA", "LA", "P"):
-                rgba = image.convert("RGBA")
-                rgb = Image.new("RGB", rgba.size, "white")
-                rgb.paste(rgba, mask=rgba.getchannel("A"))
-                image = rgb
-            else:
-                image = image.convert("RGB")
-            buffer = io.BytesIO()
-            image.save(buffer, "PNG")
-        content = buffer.getvalue()
-        # Compare bytes directly within equal-size candidates; retain HRBench deduplication.
-        candidates = self.by_size.setdefault(len(content), [])
-        for relative in candidates:
-            if (self.prepared / relative).read_bytes() == content:
-                return relative
-        self.image_count += 1
-        relative = f"images/{self.image_count:08d}.png"
-        target = self.prepared / relative
         target.parent.mkdir(parents=True, exist_ok=True)
-        temporary = target.with_suffix(".png.part")
-        temporary.write_bytes(content)
+        temporary = target.with_suffix(".img.part")
+        if isinstance(value, (str, Path)):
+            shutil.copyfile(value, temporary)
+        elif isinstance(value, (bytes, bytearray)):
+            temporary.write_bytes(value)
+        else:
+            raise TypeError(f"Unsupported official image representation: {type(value)}")
         temporary.replace(target)
-        candidates.append(relative)
+        if self.image_count == 1 or self.image_count % 100 == 0:
+            print(f"{self.prepared.parent.name}: prepared {self.image_count} image slots", flush=True)
         return relative
 
 

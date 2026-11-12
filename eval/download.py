@@ -18,7 +18,7 @@ SCIENCEQA_FULL = False       # False: 带图 test=2017；True: 全部 test=4241
 PREPARE_ONLY = False         # True: 使用已有 raw 文件，完全不联网
 # =========================================================
 
-from eval.common import SCHEMA_VERSION, read_json, read_jsonl, select_benchmarks, validate_samples, write_json
+from eval.common import SCHEMA_VERSION, read_json, read_jsonl, select_benchmarks, write_json
 from eval.data import normalize
 from eval.registry import EXPECTED_COUNTS, source_for
 
@@ -38,27 +38,36 @@ def prepare_one(name, dataset_dir, *, endpoint=HF_ENDPOINT, token=HF_TOKEN, work
     manifest_path = prepared / "manifest.json"
     if manifest_path.is_file():
         manifest = read_json(manifest_path)
-        if manifest["settings"] != settings:
+        # Old schema/implementation metadata does not invalidate prepared data.
+        previous = manifest.get("settings", {})
+        if any(previous.get(key) != settings[key] for key in ("source", "emma_variant", "scienceqa_full")):
             raise ValueError(f"{name}: existing data uses another variant/revision; choose a new DATASET_DIR")
-        samples = list(read_jsonl(prepared / "samples.jsonl"))
-        validate_samples(samples, name, prepared)
-        if len(samples) != manifest["count"]:
-            raise ValueError(f"{name}: manifest/sample count mismatch")
-        if {p for s in samples for p in s["images"].values()} != set(manifest["images"]):
-            raise ValueError(f"{name}: image manifest mismatch")
         print(f"{name}: already prepared, {manifest['count']} samples", flush=True)
         return manifest
-    if not prepare_only:
+    samples_path = prepared / "samples.jsonl"
+    # The completed JSONL is atomically renamed before the manifest is written.
+    # Recover this boundary without replaying image preparation or downloading.
+    if samples_path.is_file():
+        samples = list(read_jsonl(samples_path))
+    else:
+        samples = None
+    if samples is None and not prepare_only:
         from huggingface_hub import snapshot_download
         snapshot_download(repo_id=source.repo, repo_type="dataset", revision=source.revision,
                           allow_patterns=list(source.patterns) + ["README.md", "LICENSE*"],
                           local_dir=str(raw), endpoint=endpoint, token=token, max_workers=workers)
-    elif not raw.is_dir():
+    elif samples is None and not raw.is_dir():
         raise FileNotFoundError(raw)
     prepared.mkdir(parents=True, exist_ok=True)
+    progress_settings = prepared / "prepare_settings.json"
+    if progress_settings.is_file():
+        previous = read_json(progress_settings)
+        if any(previous.get(key) != settings[key] for key in ("source", "emma_variant", "scienceqa_full")):
+            raise ValueError(f"{name}: partial preparation uses another variant/revision; choose a new DATASET_DIR")
+    write_json(progress_settings, settings)
     print(f"{name}: preparing official release", flush=True)
-    samples = normalize(name, raw, prepared, emma_variant, scienceqa_full)
-    validate_samples(samples, name, prepared)
+    if samples is None:
+        samples = normalize(name, raw, prepared, emma_variant, scienceqa_full)
     expected = EXPECTED_COUNTS.get(name)
     if name == "emma" and emma_variant == "mini":
         expected = 400
@@ -76,8 +85,6 @@ def prepare_one(name, dataset_dir, *, endpoint=HF_ENDPOINT, token=HF_TOKEN, work
     image_paths = sorted({p for s in samples for p in s["images"].values()})
     manifest = {"settings": settings, "count": len(samples), "unique_images": len(image_paths),
                 "images": image_paths,
-                "raw_files": sorted(str(p.relative_to(raw)) for p in raw.rglob("*")
-                                    if p.is_file() and ".cache" not in p.parts and "extracted" not in p.parts),
                 "source_url": f"https://huggingface.co/datasets/{source.repo}/tree/{source.revision}"}
     write_json(manifest_path, manifest)  # Completion marker is written last.
     print(f"{name}: ready, {len(samples)} samples / {len(image_paths)} images", flush=True)

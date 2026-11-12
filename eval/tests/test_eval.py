@@ -149,7 +149,7 @@ def test_offline_download_module_produces_verified_artifact(tmp_path, monkeypatc
     (raw / "Questions.csv").write_text('Index,Question,Options,Correct Answer\n1,Which?,(a) red (b) blue,(a)\n2,Which?,(a) red (b) blue,(b)\n')
     monkeypatch.setitem(EXPECTED_COUNTS, "mmvp", 2)
     manifest = prepare_one("mmvp", tmp_path, prepare_only=True)
-    assert manifest["count"] == 2 and manifest["unique_images"] == 1
+    assert manifest["count"] == 2 and manifest["unique_images"] == 2
     assert prepare_one("mmvp", tmp_path, prepare_only=True) == manifest
     assert len(load_prepared(tmp_path, "mmvp")[2]) == 2
 
@@ -221,15 +221,16 @@ def test_archive_traversal_rejected(tmp_path, entry):
         extract_archive(archive, tmp_path / "out")
 
 
-def test_image_storage_alpha_and_content_dedup(tmp_path):
+def test_image_storage_preserves_original_bytes_without_dedup(tmp_path):
     store = ImageStore(tmp_path, tmp_path / "prepared")
     buf = io.BytesIO()
     Image.new("RGBA", (8, 8), (0, 0, 0, 0)).save(buf, "PNG")
     a = store.save(buf.getvalue())
     b = store.save({"bytes": buf.getvalue(), "path": None})
-    assert a == b
+    assert a != b
+    assert (tmp_path / "prepared" / a).read_bytes() == buf.getvalue()
     with Image.open(tmp_path / "prepared" / a) as image:
-        assert image.getpixel((0, 0)) == (255, 255, 255)
+        assert image.getpixel((0, 0)) == (0, 0, 0, 0)
 
 
 def write_parquet(path, rows):
@@ -339,5 +340,6 @@ def test_manifest_checks_structure_and_files(tmp_path):
     (root / "one.png").write_bytes(image_bytes("blue"))
     assert len(load_prepared(tmp_path, "mmstar")[2]) == 1
     (root / "one.png").unlink()
+    assert len(load_prepared(tmp_path, "mmstar")[2]) == 1
     with pytest.raises(FileNotFoundError):
-        load_prepared(tmp_path, "mmstar")
+        load_prepared(tmp_path, "mmstar", validate=True)

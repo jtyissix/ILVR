@@ -22,11 +22,13 @@ python -m pip install -r requirements-eval.txt
 `eval/` 是 ILVR Git 仓库中的普通目录，不是独立仓库或子模块。忽略规则统一位于 `ILVR/.gitignore`：默认下载目录、评测结果和 Python 工具缓存不会进入版本控制，源码、测试、依赖清单及 `vendor/` 参考代码可以正常提交。`ILVR/.gitattributes` 为评测源码固定 LF 换行。如果将数据或结果改到其他仓库内目录，需要为该自定义目录补充忽略规则。
 
 1. 修改 `download.py` 顶部的 `DATASET_DIR`、数据集选择和可选的 `HF_ENDPOINT`、`HF_TOKEN`。
-2. 执行 `python eval/download.py`。使用固定 Hugging Face revision，下载需要的文件，转换图片与标注，生成文件清单；不会下载 SEED 视频包、ScienceQA 训练集、MathVista 隐藏答案的 test。
+2. 执行 `python eval/download.py`。使用固定 Hugging Face revision，下载需要的文件，原样保存图片并转换标注，生成文件清单；不会下载 SEED 视频包、ScienceQA 训练集、MathVista 隐藏答案的 test。
 3. 修改 `evaluate.py` 顶部的 `DATASET_DIR`、`MODEL_DIR`，以及判分需要的 `API_KEY`。兼容第三方接口时同时填写 `API_BASE_URL` 和 `JUDGE_MODEL`。基座与训练模型用不同 `RUN_NAME`。
 4. 执行 `python eval/evaluate.py`。
 
 `MODEL_DIR` 可以是原始模型的本地 HF 目录、训练导出根目录，或其 `backbone/` 子目录。必须包含对应 tokenizer、processor 和完整 HF 权重；DeepSpeed 原始分片需要先用项目的 `export_stage2` / `export_warmup` 导出。不会退回基座权重或基座 tokenizer 掩盖缺失文件。
+
+断点处理：保持原 `DATASET_DIR` 重跑即可跳过已完成的数据集；已有完整 `samples.jsonl` 但缺少清单时，会直接补齐清单。新版处理中断后按 `images/source_*.img` 逐图续接，存在的文件直接跳过，`.part` 临时文件重写。`.img` 内保留原始 JPEG/PNG 等编码，推理时由图像库识别。旧版只生成了部分去重图片、尚未写出标注时，没有原题到图片的映射，无法可靠恢复这些散图；它们会原样保留，未完成的数据集走新的快速原图保存流程。
 
 下载后的结构为：
 
@@ -37,7 +39,7 @@ DATASET_DIR/
     prepared/
       samples.jsonl
       images/
-      manifest.json         # revision、实际条数、图片与原始文件列表
+      manifest.json         # revision、实际条数、图片列表
   mmstar/ ...
 ```
 
@@ -104,7 +106,7 @@ MM-Math 的**图片数不等于题数**；最终条数以下载后 JSONL 和 `ma
 - `RESUME=True` 复用成功结果、重试失败题。API 超时、限流、无效格式不会被记为模型答错；已生成答案保留，未完成判分时主 `score=null`，并报告 `partial_score` 与实际覆盖量。
 - `MAX_SAMPLES` 仅用于调试，结果标记 `diagnostic_subset`，且不会截断 MMVP 题对或 HRBench 四轮组。
 - `RULES_ONLY=True` 是明确标注的离线简化版；不用于官方对齐成绩。MathVista 不会因此静默切换成不可靠的规则评分。
-- 模型记录路径、文件大小和修改时间；配置以原始 JSON 直接比较，结果和缓存按编号保存。目录中的 `index.sqlite3` 保存编号映射，复制结果或缓存时须一起保留。图片通过直接比较内容去重。数据检查只覆盖条数、文件存在性和结构，不检查内容摘要；修改数据、源码或覆盖模型后请使用新的 `RUN_NAME`。旧版准备数据请在新 `DATASET_DIR` 重新准备，旧版结果目录不自动迁移。
+- 模型记录路径、文件大小和修改时间；配置以原始 JSON 直接比较，结果和缓存按编号保存。目录中的 `index.sqlite3` 保存编号映射，复制结果或缓存时须一起保留。图片原样保存，不解码转 PNG、不去重、不比较内容。下载时遇到已有 `manifest.json` 直接复用，兼容旧版清单，不扫描图片和标注；普通评测只读标注并核对条数，只有显式 `MODE="validate"` 才检查图片存在性和结构。修改数据、源码或覆盖模型后请使用新的 `RUN_NAME`。
 
 结果在 `OUTPUT_DIR/RUN_NAME/summary.json` 和 `summary.csv`，每完成一个数据集就更新两份汇总，并在终端打印该数据集的准确率。**全部数据集统一报告逐题准确率**，包括使用候选 NLL 的 V* 和 SEED-Bench（先选出候选，再与金标准比较）：
 

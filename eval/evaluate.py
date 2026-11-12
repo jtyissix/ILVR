@@ -59,20 +59,18 @@ def model_metadata(directory):
     return {"path": str(root), "files": files}
 
 
-def load_prepared(root, name, *, limit=None):
+def load_prepared(root, name, *, limit=None, validate=False):
     prepared = Path(root) / name / "prepared"
     manifest = read_json(prepared / "manifest.json")
     samples = list(read_jsonl(prepared / "samples.jsonl"))
     if len(samples) != manifest["count"]:
         raise ValueError(f"{name}: manifest/sample count mismatch")
-    validate_samples(samples, name, prepared)
-    expected_images = {p for s in samples for p in s["images"].values()}
-    if expected_images != set(manifest["images"]):
-        raise ValueError(f"{name}: image manifest mismatch")
+    if validate:
+        validate_samples(samples, name, prepared)
     samples = subset_samples(samples, limit)
-    # Build all prompts now: malformed options/inline image references fail before GPU work.
-    for sample in samples:
-        messages_for(sample, prepared)
+    if validate:
+        for sample in samples:
+            messages_for(sample, prepared)
     return prepared, manifest, samples
 
 
@@ -161,8 +159,8 @@ def main():
     run_root.mkdir(parents=True, exist_ok=True)
     prepared_data = {}
     for name in selected:
-        print(f"Validating {name}...", flush=True)
-        prepared_data[name] = load_prepared(DATASET_DIR, name, limit=MAX_SAMPLES)
+        print(f"Loading {name}...", flush=True)
+        prepared_data[name] = load_prepared(DATASET_DIR, name, limit=MAX_SAMPLES, validate=MODE == "validate")
     if MODE == "validate":
         print("All selected datasets, images and prompts passed validation.", flush=True)
         return
