@@ -8,20 +8,20 @@ if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 # ===================== 只修改此配置区 =====================
-DATASET_DIR = str(Path(__file__).resolve().parent / "datasets")
-MODEL_DIR = r"/path/to/Qwen2.5-VL-7B-Instruct"  # 或训练导出目录，自动定位其中的 backbone/
+DATASET_DIR = "/home/fit/renjujty/WORK/jty/dataset/lm-eval/"
+MODEL_DIR = r"/home/fit/renjujty/WORK/jty/ilvr-tmp/sft2_offload/export/"  # 或训练导出目录，自动定位其中的 backbone/
 MODEL_KIND = "auto"              # auto / base / trained；auto 识别项目 SFT-II 导出标记
-ONLY_DATASETS = ["all"]          # 全测用 ['all']；例如 ['mmvp', 'mathvista', 'hrbench']
-EXCLUDE_DATASETS = []            # 两者必须恰好一个非空，例如 ONLY=[]、EXCLUDE=['seedbench']
-OUTPUT_DIR = str(Path(__file__).resolve().parent / "outputs")
-RUN_NAME = "qwen25vl7b"          # 区分模型；修改配置也会自动分配不同的结果子目录
+ONLY_DATASETS = []          # 全测用 ['all']；例如 ['mmvp', 'mathvista', 'hrbench']
+EXCLUDE_DATASETS = ['seedbench']            # 两者必须恰好一个非空，例如 ONLY=[]、EXCLUDE=['seedbench']
+OUTPUT_DIR = "/home/fit/renjujty/WORK/jty/ilvr-train/ILVR/outputs/"
+RUN_NAME = "sftiieval"          # 区分模型；修改配置也会自动分配不同的结果子目录
 MODE = "all"                    # all / infer / score / validate；score 不加载模型、不需要 GPU
 RESUME = True                   # 已成功的逐题结果可恢复；失败题下次自动重试
 MAX_SAMPLES = None              # 只用于调试；MMVP/HRBench 保留完整题对/循环组
 
 DEVICE = "cuda:0"               # 每个进程单张卡；可分别选择不同数据集运行
 DTYPE = "bfloat16"              # bfloat16 / float16 / float32
-ATTENTION_BACKEND = "sdpa"      # sdpa / eager / flash_attention_2（需另装 flash-attn）
+ATTENTION_BACKEND = "flash_attention_2"      # sdpa / eager / flash_attention_2（需另装 flash-attn）
 MIN_PIXELS = None               # None 使用保存的 processor 配置；单位为像素面积
 MAX_PIXELS = None               # 基座和训练模型应保持一致；HRBench 高分辨率需要足够显存
 MAX_NEW_STEPS = 4096            # 文本 token + 连续 latent 位置的共同预算
