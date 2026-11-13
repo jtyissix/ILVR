@@ -1,5 +1,7 @@
 # [ACL'26 Oral] ILVR: Interleaved Latent Visual Reasoning with Selective Perceptual Modeling
 
+**SFT-III latent relaxation:** See [第三阶段训练指南](docs/sft3_relaxation_zh.md) for backbone-only text CE with autoregressive 4/3/16 latent blocks and optional distance-weighted anti-collapse loss. Set `stage2_path`, `prepared_dir`, `collapse_targets` (`0`, `1`, `12`, `123`, `23`, etc.) and `collapse_weight` in `configs/sft3/relaxation.json`, then run `python run_sft3.py`.
+
 **SFT-II continuation from warm-up:** See [第二阶段训练指南](docs/sft2_training_zh.md) for the single stream of 4 action latents, 3 helper-conditioned interaction tokens and 16 visual latents with supervised latent start/end boundaries, four training losses, offline teacher targets, and complete checkpoint resume. Set the stage-I export and data paths in `configs/sft2/latent.json`, then run `python run_sft2.py`.
 
 **Zebra-CoT evaluation:** See [Jigsaw / Visual Search 数据准备与评测](docs/zebra_evaluation_zh.md) for individual Parquet shards or full downloads, shared baseline/Interaction evaluation, rule scoring, and optional offline judge scoring.
