@@ -31,9 +31,9 @@ SEED = 42                      # greedy 生成；也固定 VisualPuzzles 官方�
 LIKELIHOOD_DATASETS = ["vstar", "seedbench"]  # 官方候选答案 NLL；清空则改为生成式（非原始协议）
 LIKELIHOOD_INCLUDE_EOS = True   # 以 Qwen 对话结束 token 对应原模型的答案终止符
 
-API_KEY = os.environ.get("OPENAI_API_KEY", "")  # 判分/抽取用；不参与本地模型推理
-API_BASE_URL = os.environ.get("OPENAI_BASE_URL", "https://api.openai.com/v1")
-JUDGE_MODEL = "gpt-4o"          # 可换兼容接口；比较实验必须使用同一判分模型
+API_KEY = "sk-27778a0f064d4aa5ae1b001b19461325"  # 判分/抽取用；不参与本地模型推理
+API_BASE_URL = "https://api.deepseek.com"
+JUDGE_MODEL = "deepseek-flash"          # 可换兼容接口；比较实验必须使用同一判分模型
 JUDGE_MODELS = {}               # 可逐项指定，如 {'mathvista': '...', 'hrbench_4k': '...'}
 JUDGE_TIMEOUT = 60
 JUDGE_RETRIES = 3
