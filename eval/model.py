@@ -3,6 +3,7 @@
 No imports from training/interaction modules. No auxiliary module is constructed.
 """
 from dataclasses import dataclass
+import inspect
 from pathlib import Path
 
 from .common import read_json
@@ -15,7 +16,7 @@ def resolve_backbone(directory):
     if not (root / "config.json").is_file():
         raise ValueError(f"MODEL_DIR must be a local Qwen directory or exported bundle containing backbone/: {root}")
     if not list(root.glob("*.safetensors")) and not list(root.glob("pytorch_model*.bin")):
-        raise ValueError("No HF model weights found; export the training checkpoint with export_stage2/export_warmup first")
+        raise ValueError("No HF model weights found; export with export_stage3/export_stage2/export_warmup first")
     return root
 
 
@@ -91,7 +92,11 @@ class QwenBackbone:
         config = AutoConfig.from_pretrained(self.root, local_files_only=True, trust_remote_code=False)
         if config.model_type != "qwen2_5_vl":
             raise ValueError("Only Qwen2.5-VL checkpoints are supported")
-        trained = bool(getattr(config, "sft2_helper_conditioned_backbone", False) or
+        stage = ("sft3" if getattr(config, "sft3_latent_relaxation_backbone", False) else
+                 "sft2" if getattr(config, "sft2_helper_conditioned_backbone", False) or
+                 getattr(config, "sft2_boundary_policy", None) else "base")
+        trained = bool(getattr(config, "sft3_latent_relaxation_backbone", False) or
+                       getattr(config, "sft2_helper_conditioned_backbone", False) or
                        getattr(config, "sft2_boundary_policy", None))
         if model_kind == "trained":
             trained = True
@@ -129,6 +134,9 @@ class QwenBackbone:
         if names:
             raise ValueError(f"Unexpected auxiliary modules in backbone: {names}")
         self.model.eval()
+        # The ILVR fork otherwise selects its Ulysses training attention path.
+        self.decoder_kwargs = ({"generate_mode": True} if "generate_mode" in
+                               inspect.signature(self.model.model.forward).parameters else {})
         self.embedding = self.model.get_input_embeddings()
         self.input_device = self.embedding.weight.device
         eos = getattr(self.model.generation_config, "eos_token_id", None)
@@ -142,6 +150,8 @@ class QwenBackbone:
             invalid.update({start, end})
         self.invalid_ids = sorted(invalid - {None})
         self.runtime = {"model_dir": str(self.root), "transformers": transformers.__version__,
+                        "training_stage": stage,
+                        "decoder_inference_kwargs": self.decoder_kwargs,
                         "torch": torch.__version__, "latent_enabled": trained,
                         "latent_start_id": start, "latent_end_id": end,
                         "loaded_modules": [n for n, _ in self.model.named_children()],
@@ -190,7 +200,7 @@ class QwenBackbone:
         self._check_context(length + self.max_new_steps)
         output = self.model.model(inputs_embeds=embeds, position_ids=positions,
                                   attention_mask=inputs["attention_mask"], use_cache=True, return_dict=True,
-                                  cache_position=self.torch.arange(length, device=self.input_device))
+                                  cache_position=self.torch.arange(length, device=self.input_device), **self.decoder_kwargs)
         return {"hidden": output.last_hidden_state[:, -1:].clone(), "cache": output.past_key_values,
                 "mask": inputs["attention_mask"], "next_position": int(positions.max()) + 1,
                 "length": length}
@@ -219,7 +229,7 @@ class QwenBackbone:
         positions = torch.full((3, 1, 1), state["next_position"], device=self.input_device, dtype=torch.long)
         output = self.model.model(inputs_embeds=embeds, attention_mask=mask, position_ids=positions,
                                   past_key_values=state["cache"], use_cache=True, return_dict=True,
-                                  cache_position=torch.tensor([state["length"]], device=self.input_device))
+                                  cache_position=torch.tensor([state["length"]], device=self.input_device), **self.decoder_kwargs)
         return {"hidden": output.last_hidden_state[:, -1:].clone(), "cache": output.past_key_values,
                 "mask": mask, "next_position": state["next_position"] + 1, "length": state["length"] + 1}
 
@@ -260,7 +270,7 @@ class QwenBackbone:
                 output = self.model.model(inputs_embeds=embeds,
                     position_ids=torch.cat([positions, option_positions], dim=-1),
                     attention_mask=torch.ones((1, embeds.shape[1]), device=self.input_device, dtype=torch.long),
-                    use_cache=False, return_dict=True)
+                    use_cache=False, return_dict=True, **self.decoder_kwargs)
                 # Predict first answer token from last prompt state, last answer
                 # token from penultimate state. Never score prompt or final state.
                 hidden = output.last_hidden_state[:, prefix_len - 1:-1]

@@ -12,7 +12,8 @@ class Judge:
         self.models = models or {}
         self.cache_dir, self.timeout, self.retries = Path(cache_dir), timeout, retries
 
-    def ask(self, benchmark, prompt, *, system=None, temperature=0, max_tokens=512, expected_pattern=None):
+    def ask(self, benchmark, prompt, *, system=None, temperature=0, max_tokens=512, expected_pattern=None,
+            response_validator=None):
         messages = ([{"role": "system", "content": system}] if system else [])
         messages.append({"role": "user", "content": prompt})
         payload = {"model": self.models.get(benchmark, self.model), "messages": messages,
@@ -20,8 +21,14 @@ class Judge:
         identity = {"url": self.base_url, "request": payload}
         path = record_path(self.cache_dir, identity)
         def valid(result):
-            return isinstance(result, str) and bool(result.strip()) and (
-                expected_pattern is None or re.fullmatch(expected_pattern, result.strip(), re.I | re.S) is not None)
+            if not isinstance(result, str) or not result.strip():
+                return False
+            if expected_pattern is not None and re.fullmatch(expected_pattern, result.strip(), re.I | re.S) is None:
+                return False
+            try:
+                return response_validator is None or bool(response_validator(result))
+            except (ValueError, TypeError, KeyError, AttributeError):
+                return False
         if path.is_file():
             cached = read_json(path)
             if all(cached.get(key) == value for key, value in identity.items()) and valid(cached.get("response")):

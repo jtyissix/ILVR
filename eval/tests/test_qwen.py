@@ -133,3 +133,44 @@ def test_generation_runs_for_base_and_latent_backbone(backend, checkpoint, tmp_p
     base = QwenBackbone(checkpoint, model_kind="base", device="cpu", dtype="float32", max_new_steps=3)
     result = base.generate(messages(tmp_path))
     assert result["latent_segments"] == [] and 7 not in result["token_ids"] and 8 not in result["token_ids"]
+
+
+def test_actual_stage3_export_loads_and_matches_23_step_recurrence(checkpoint, tmp_path):
+    from types import SimpleNamespace
+    from src.sft3.checkpoint import export_stage3
+    from src.sft3.config import Stage3Config
+    from src.sft3.model import RelaxationModel
+    from eval.common import read_json, write_json
+    from transformers import AutoProcessor, Qwen2_5_VLForConditionalGeneration
+
+    full = Qwen2_5_VLForConditionalGeneration.from_pretrained(checkpoint, attn_implementation="sdpa").eval()
+    recipe = Stage3Config(attention_backend="sdpa", activation_checkpointing=False)
+    student = RelaxationModel(full.model, full.lm_head, full.config, recipe)
+    processor = AutoProcessor.from_pretrained(checkpoint)
+    exported = tmp_path / "export"
+    export_stage3(SimpleNamespace(module=student), full.visual, processor, exported, recipe, "test-source")
+    # SFT3 must be recognized on its own; no accidental reliance on inherited SFT2 flags.
+    metadata = read_json(exported / "backbone/config.json")
+    metadata.pop("sft2_boundary_policy", None)
+    write_json(exported / "backbone/config.json", metadata)
+    backend = QwenBackbone(exported, device="cpu", dtype="float32", attention="sdpa", max_new_steps=40)
+    assert backend.policy.enabled and backend.runtime["training_stage"] == "sft3"
+    assert backend.runtime["loaded_modules"] == ["visual", "model", "lm_head"]
+    for name, tensor in full.state_dict().items():
+        torch.testing.assert_close(backend.model.state_dict()[name], tensor, atol=0, rtol=0)
+    with torch.inference_mode():
+        inputs = backend._inputs(messages(tmp_path))
+        prefix, positions = backend._embed(inputs)
+        state = backend._prefill(inputs)
+        # SFT3 uses the same hidden-state recurrence for all 4+3+16 positions.
+        # Compare the evaluator against the actual training DecoderExecutor.
+        state = backend.advance(state, 7)
+        prefix = torch.cat([prefix, backend.embedding(torch.tensor([[7]]))], dim=1)
+        positions = torch.cat([positions, torch.full((3, 1, 1), int(positions.max()) + 1)], dim=-1)
+        for token in [None] * 23 + [8, 13]:
+            embeds = state["hidden"] if token is None else backend.embedding(torch.tensor([[token]]))
+            prefix = torch.cat([prefix, embeds], dim=1)
+            positions = torch.cat([positions, torch.full((3, 1, 1), state["next_position"])], dim=-1)
+            state = backend.advance(state, token)
+            reference, _ = student.executor.chunk(prefix, torch.ones(prefix.shape[:2], dtype=torch.long), positions)
+            torch.testing.assert_close(state["hidden"], reference[:, -1:], atol=3e-6, rtol=3e-5)

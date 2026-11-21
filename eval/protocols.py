@@ -97,7 +97,13 @@ def extract_letter(text, choices):
     return hits[0] if len(hits) == 1 else None
 
 
-def score_one(sample, prediction, judge, *, seed=42, mm_math_precision=1e-2, rules_only=False):
+def score_one(sample, prediction, judge, *, seed=42, mm_math_precision=1e-2, rules_only=False,
+              scoring_protocol="official"):
+    if scoring_protocol not in ("official", "robust"):
+        raise ValueError("SCORING_PROTOCOL must be official or robust")
+    if scoring_protocol == "robust" and prediction.get("method") != "likelihood":
+        from .answers import score_robust
+        return score_robust(sample, prediction, judge, precision=mm_math_precision, rules_only=rules_only)
     name, gold = sample["benchmark"], sample["answer"]
     if prediction.get("method") == "likelihood":
         extracted = prediction["selected"]

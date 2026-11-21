@@ -4,6 +4,7 @@ Reporting is separate from prompting/scoring so presentation changes do not
 invalidate saved inference or per-question judge results.
 """
 import csv
+from collections import Counter
 from pathlib import Path
 
 from .common import write_json
@@ -17,6 +18,7 @@ SUMMARY_COLUMNS = [
     "metric", "score", "score_percent", "partial_score",
     "complete", "predictions", "diagnostic_subset", "full_dataset_count",
     "truncated_predictions", "output",
+    "scoring_protocol", "scorer_version", "protocol_modified", "api_fallback_count", "unparsed_count",
 ]
 
 
@@ -32,6 +34,10 @@ def aggregate(samples, scores):
     accuracy = observed_accuracy if pending == 0 else None
     partial_accuracy = observed_accuracy if pending else None
     summary.update(
+        extraction_methods=dict(Counter(scores[s["id"]].get("extraction_method", "original_protocol")
+                                        for s in samples if s["id"] in scores and scores[s["id"]].get("score") is not None)),
+        api_fallback_count=sum(bool(scores[s["id"]].get("api_fallback")) for s in samples
+                               if s["id"] in scores and scores[s["id"]].get("score") is not None),
         accuracy=accuracy,
         accuracy_percent=100 * accuracy if accuracy is not None else None,
         correct=correct, incorrect=scored - correct, pending=pending,
@@ -58,6 +64,8 @@ def write_summaries(root, summaries):
 
 def format_summary(summary):
     label = summary["benchmark"]
+    if summary.get("protocol_modified"):
+        label += " [robust extraction; modified protocol]"
     if summary.get("diagnostic_subset"):
         label += " [diagnostic subset]"
     counts = f"correct={summary['correct']}/{summary['scored']}, scored={summary['scored']}/{summary['expected']}"

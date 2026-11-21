@@ -27,3 +27,22 @@ def test_bad_judge_response_retried_cache_and_key_not_persisted(tmp_path, monkey
     assert restarted.ask("mmvp", "question", expected_pattern="yes|no") == "yes"
     with pytest.raises(RuntimeError, match="requires API_KEY"):
         judge.ask("mmvp", "another question")
+
+
+def test_structured_extraction_retries_bad_evidence_before_caching(tmp_path, monkeypatch):
+    import json
+    import requests
+    from eval.answers import api_extract
+    replies = iter([json.dumps({"answer": "A", "evidence": "invented"}),
+                    json.dumps({"answer": "A", "evidence": "reddish item"})])
+    class Response:
+        status_code = 200
+        def json(self):
+            return {"choices": [{"message": {"content": next(replies)}}]}
+    monkeypatch.setattr(requests, "post", lambda *a, **kw: Response())
+    monkeypatch.setattr("eval.judge.time.sleep", lambda _: None)
+    judge = Judge("test-key", "https://example.invalid", "test-model", tmp_path)
+    result = api_extract("Which?", "I select the reddish item.", {"A": "red", "B": "blue"}, judge, "mmstar")
+    assert result.answer == "A" and result.evidence == "reddish item"
+    cached = json.loads(next(tmp_path.glob("*.json")).read_text())
+    assert "invented" not in cached["response"]

@@ -10,7 +10,7 @@ if __package__ in (None, ""):
 # ===================== 只修改此配置区 =====================
 DATASET_DIR = "/home/fit/renjujty/WORK/jty/dataset/lm-eval/"
 MODEL_DIR = r"/home/fit/renjujty/WORK/jty/ilvr-tmp/sft2_offload/export/"  # 或训练导出目录，自动定位其中的 backbone/
-MODEL_KIND = "auto"              # auto / base / trained；auto 识别项目 SFT-II 导出标记
+MODEL_KIND = "auto"              # auto / base / trained；auto 识别 SFT-II / SFT3 导出
 ONLY_DATASETS = []          # 全测用 ['all']；例如 ['mmvp', 'mathvista', 'hrbench']
 EXCLUDE_DATASETS = ['seedbench']            # 两者必须恰好一个非空，例如 ONLY=[]、EXCLUDE=['seedbench']
 OUTPUT_DIR = "/home/fit/renjujty/WORK/jty/ilvr-train/ILVR/outputs/"
@@ -38,12 +38,14 @@ JUDGE_MODELS = {}               # 可逐项指定，如 {'mathvista': '...', 'hr
 JUDGE_TIMEOUT = 60
 JUDGE_RETRIES = 3
 RULES_ONLY = False              # 离线规则简化版，会标注非官方；MathVista 不允许静默简化
+SCORING_PROTOCOL = "robust"     # robust: 最终答案提取+API兜底（所有模型统一）；official: 原协议
 MM_MATH_PRECISION = 1e-2        # 原 MM-Math CLI 默认精度
 # =========================================================
 
 from eval.common import (record_path, read_json, read_jsonl, safe_path, select_benchmarks,
                          subset_samples, validate_samples, write_json)
 from eval.judge import Judge
+from eval.answers import SCORER_VERSION
 from eval.model import QwenBackbone, resolve_backbone
 from eval.protocols import messages_for, score_one
 from eval.reporting import aggregate, format_summary, write_summaries
@@ -87,7 +89,7 @@ def saved_result(directory, sample_id, identity, resume=True):
 
 def run_dataset(samples, prepared, output, inference_id, score_id, *, backend_factory,
                 judge, mode="all", likelihood=False, include_eos=True, resume=True,
-                rules_only=False, seed=42, precision=1e-2):
+                rules_only=False, seed=42, precision=1e-2, scoring_protocol="official"):
     """Separate inference and scoring records so judge outages never lose predictions."""
     output = Path(output)
     scores, prediction_count, errors, truncated, latent = {}, 0, [], 0, 0
@@ -120,11 +122,12 @@ def run_dataset(samples, prepared, output, inference_id, score_id, *, backend_fa
         latent += len(prediction.get("latent_segments", []))
         if mode in ("all", "score"):
             # Compare the actual prediction and scoring settings on resume.
-            item_score_id = [score_id, prediction, sample]
+            item_score_id = [score_id, prediction, sample, scoring_protocol, SCORER_VERSION]
             score_path, scored = saved_result(output / "scores" / score_id, uid, item_score_id, resume)
             if scored is None:
                 try:
-                    result = score_one(sample, prediction, judge, seed=seed, mm_math_precision=precision, rules_only=rules_only)
+                    result = score_one(sample, prediction, judge, seed=seed, mm_math_precision=precision,
+                                       rules_only=rules_only, scoring_protocol=scoring_protocol)
                     scored = {"id": uid, "identity": item_score_id, "status": "ok", **result}
                     write_json(score_path, scored)
                 except Exception as exc:
@@ -138,6 +141,8 @@ def run_dataset(samples, prepared, output, inference_id, score_id, *, backend_fa
     summary = aggregate(samples, scores)
     summary.update(predictions=prediction_count, truncated_predictions=truncated, latent_segments=latent,
                    inference_id=inference_id, score_id=score_id, rules_only=rules_only,
+                   scoring_protocol=scoring_protocol, scorer_version=SCORER_VERSION,
+                   protocol_modified=scoring_protocol == "robust" and not likelihood,
                    inference_method="likelihood" if likelihood else "generation", output=str(output))
     if mode == "infer":
         summary["complete"] = prediction_count == len(samples)
@@ -151,6 +156,8 @@ def main():
     selected = select_benchmarks(ONLY_DATASETS, EXCLUDE_DATASETS)
     if MODE not in ("all", "infer", "score", "validate"):
         raise ValueError("MODE must be all/infer/score/validate")
+    if SCORING_PROTOCOL not in ("official", "robust"):
+        raise ValueError("SCORING_PROTOCOL must be official or robust")
     if set(LIKELIHOOD_DATASETS) - {"seedbench", "vstar"}:
         raise ValueError("LIKELIHOOD_DATASETS supports only seedbench/vstar")
     if JUDGE_RETRIES < 1 or JUDGE_TIMEOUT <= 0:
@@ -170,6 +177,7 @@ def main():
                            "max_new_steps": MAX_NEW_STEPS, "min_latent_steps": MIN_LATENT_STEPS,
                            "max_latent_steps": MAX_LATENT_STEPS, "seed": SEED}
     scoring_settings = {"base_url": API_BASE_URL, "judge_model": JUDGE_MODEL, "judge_models": JUDGE_MODELS,
+                        "scoring_protocol": SCORING_PROTOCOL, "scorer_version": SCORER_VERSION,
                         "rules_only": RULES_ONLY, "mm_math_precision": MM_MATH_PRECISION, "seed": SEED}
     score_config = record_path(run_root / "scoring_configs", scoring_settings)
     write_json(score_config, scoring_settings)
@@ -201,7 +209,7 @@ def main():
         result = run_dataset(samples, prepared, destination, inference_id, score_id,
                              backend_factory=get_backend, judge=judge, mode=MODE, likelihood=likelihood,
                              include_eos=LIKELIHOOD_INCLUDE_EOS, resume=RESUME, rules_only=RULES_ONLY,
-                             seed=SEED, precision=MM_MATH_PRECISION)
+                             seed=SEED, precision=MM_MATH_PRECISION, scoring_protocol=SCORING_PROTOCOL)
         result.update(diagnostic_subset=len(samples) != manifest["count"], full_dataset_count=manifest["count"],
                       source=manifest["source_url"])
         write_json(destination / f"summary_{score_id}.json", result)
