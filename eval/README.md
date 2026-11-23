@@ -112,7 +112,11 @@ SFT3 的 text/action、interaction、visual 三类 latent 均使用上一位置�
 
 若需原协议复现，设 `SCORING_PROTOCOL="official"`，保留原 MMStar 前缀规则、ScienceQA/VisualPuzzles 随机兜底及原 judge。不要对不同模型选择较高的一套成绩；报告比较时统一协议、judge、参数和覆盖率。
 
-已有预测无需重新生成：保持原 `MODEL_DIR`、`RUN_NAME` 及推理配置，设置 `MODE="score"`、`SCORING_PROTOCOL="robust"`。新评分版本会分配新的判分目录，旧逐题评分仍保留。要另报原协议，再用 `SCORING_PROTOCOL="official"` 重评分；两种结果不会取最大值。修改模型权重或推理设置时另用 `RUN_NAME`。
+已有预测无需重新生成：设置 `MODE="score"`、`SCORING_PROTOCOL="robust"`，`OUTPUT_DIR` / `RUN_NAME` 指向原结果目录。score 直接读取保存的推理配置、题目快照和预测，不读取 `MODEL_DIR`、模型权重、图片或本机推理参数。新评分版本会分配新的判分目录，旧逐题评分仍保留。要另报原协议，再用 `SCORING_PROTOCOL="official"` 重评分；两种结果不会取最大值。修改模型权重或推理设置后重新推理时另用 `RUN_NAME`。
+
+API 不通时可在 GPU 机器设置 `MODE="infer"` 完成推理，然后将整个 `OUTPUT_DIR/RUN_NAME/` 文件夹复制到可访问 API 的机器（包括所有 JSON、题目快照、子目录和 SQLite 索引），并使用同版 `eval/` 代码。评分机设置 `MODE="score"`、复制后的 `OUTPUT_DIR` / `RUN_NAME`、数据集选择和 API 配置即可运行，不需要 GPU、模型权重或数据集图片；需要相应的判分依赖。`MAX_SAMPLES` 在 score 模式不重新裁剪，沿用已保存的题目范围。
+
+每组预测开始前会写入 `samples_snapshot.json`，未生成或推理失败的题仍保留在分母中。同一数据集有多组推理结果时，用 `SCORE_INFERENCE_IDS={"mm_math": "00000001"}` 明确选择；只有一组时保持 `{}`。兼容旧版完整预测内嵌的题目信息；旧版未完成且没有完整快照时，额外复制该数据集的 `prepared/samples.jsonl` 并设置 `DATASET_DIR`，无需图片。
 
 ## 配置、结果与恢复
 
@@ -160,6 +164,50 @@ SFT3 的 text/action、interaction、visual 三类 latent 均使用上一位置�
 7. **ScienceQA / BLINK / EMMA**：使用有公开答案的默认范围。没有拿隐藏 test 生成一个假的本地准确率。ScienceQA 的 lecture/solution 不进入输入；EMMA 的占位符图片保持顺序及重复引用。
 
 原始代码来源和 commit 在 `vendor/sources.json`；许可证和来源说明在 `vendor/NOTICE.md`。提示与计分规则主要对应：[MMVP](https://github.com/tsb0601/MMVP)、[MMStar](https://github.com/MMStar-Benchmark/MMStar)、[V*](https://github.com/penghao-wu/vstar)、[HRBench](https://github.com/DreamMr/HR-Bench)、[MathVista](https://github.com/lupantech/MathVista)、[MM-Math](https://github.com/kge-sun/MM-Math)、[ScienceQA](https://github.com/lupantech/ScienceQA)、[EMMA](https://github.com/EMMA-Bench/EMMA)、[BLINK](https://github.com/zeyofu/BLINK_Benchmark)、[VisualPuzzles](https://github.com/neulab/VisualPuzzles)、[VisuLogic](https://github.com/VisuLogic-Benchmark/VisuLogic-Eval)、[SEED-Bench](https://github.com/AILab-CVC/SEED-Bench)。
+
+## 单题 latent attention 原图热力图
+
+修改 `eval/visualize_latent.py` 顶部配置，从 ILVR 根目录运行：
+
+```bash
+python eval/visualize_latent.py
+```
+
+每次只处理一个数据集的一条已保存结果。`FILE_ID` 是你在文件夹里看到的 **JSON 文件名编号**，不是 JSON 内部的 `id`：
+
+```python
+EVAL_ROOT = "/path/to/latent_exp/eval"
+RUN_NAME = "sft3eval"
+DATASET = "mmstar"
+INFERENCE_ID = "00000001"
+SCORE_ID = "00000001"
+RECORD_KIND = "scores"
+FILE_ID = "00001365"  # 也接受 1365 或 "00001365.json"
+DATASET_DIR = "/path/to/lm-eval"
+MODEL_DIR = "/path/to/sft3/export"  # None 则读取原 inference_config.json 的路径
+LAYERS = [-4, -3, -2, -1]
+```
+
+这会直接打开 `EVAL_ROOT/sft3eval/mmstar/00000001/scores/00000001/00001365.json`，从其 `identity` 中取出对应问题和预测。不会把同名 `predictions/00001365.json` 当成同一道题，也不会用编号加减来推算样本。若你查看的是 predictions 文件夹，应设置 `RECORD_KIND="predictions"`；此时 `SCORE_ID` 不使用。
+
+`DATASET_DIR` 指向下载工具生成的数据根目录，图片须存在于 `{DATASET}/prepared/images/`。记录里有题目，但通常没有图片本体。`MODEL_DIR` 必须指向产生该记录的同一个 checkpoint；本工具不下载模型或数据。`VALIDATE_ONLY=True` 可先检查编号、样本和图片路径，不加载模型。
+
+输出位于 `ILVR/outputs/latent_attention/{RUN_NAME}/{DATASET}/scores_{文件编号}_{时间}/`：
+
+- `index.html`：本地双击打开，滑条或左右方向键逐步查看；显示段号、段内步、此前文本，以及该步分配给每张输入图的注意力占比。
+- `overlays/latent_00001_image_001.png`：每个连续 latent step、每个输入图分别保存原图叠加热力图。
+- `image_001_original.png`：用于对照的原图。
+- `contact_image_001_page_001.jpg`：每页最多 24 步的缩略总览。
+- `attention/latent_00001.npz`：原始注意力数组，`image_001` 的形状为 `[所选层, 合并后网格高, 合并后网格宽]`，已对所有 heads 求均值，未在图片内部重新归一化。
+- `manifest.json`：原记录路径、内部样本 ID、模型设置、图像 token 范围、每步索引、色标和回放分歧。失败时 `complete=false`，不会把部分结果标成完成。
+
+热图使用所选 decoder 层与全部 attention heads 的均值；`LAYERS="all"` 使用所有层，`[-1]` 只看最后一层。每张图的全部步骤共享色标，低值透明、高值黄至红；图像注意力占比保留相对**全部上下文 token**的概率质量，避免把一个几乎不看图片的步骤单独归一化成很红。多图及重复图片引用按实际输入顺序分别输出。PNG 可缩小到 `DISPLAY_MAX_SIDE`，模型输入分辨率仍沿用原评测配置。
+
+评测 JSON 没有 attention 或连续隐藏状态，因此需要重新前向：固定已保存的文本 token 和 latent 边界，重新计算连续隐藏状态。每张图对应的是 **输入上一步完整 decoder 输出的最终 hidden state 作为下一连续位置时，该位置的注意力**；latent_start/end 不计作 latent step。`decode_step` 沿用评测记录的零基编号，段号和段内步从 1 开始。
+
+为避免 prefill 的全序列注意力矩阵占用大量显存，prefill/文本步使用 SDPA，仅连续 latent 的单 query 前向请求 attention（兼容的 Qwen 实现会回退到 eager）。这不会强制重新自由生成另一条回答，但与原 FlashAttention 推理可能有数值差异。工具检查 prompt 长度、图像网格、边界 token，并在 `policy_mismatches` 中记录重算 greedy 策略与保存轨迹的分歧；它展示的是**按原轨迹重建的注意力**，不声称逐位复现历史权重。注意力热点不是因果解释，也不能单独证明某区域被正确理解。
+
+原始模型或某道题没有连续 latent 时，不会伪造热图，页面会注明没有 latent step。V*/SEED 的 likelihood/NLL 记录本身没有 latent 生成过程，会明确报错；需要选择已有的 generation 结果才可分析。
 
 ## 验证
 

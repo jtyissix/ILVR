@@ -217,7 +217,12 @@ class QwenBackbone:
             logits[:, forbidden] = -float("inf")
         return int(logits.argmax(-1).item())
 
-    def advance(self, state, token=None):
+    def advance(self, state, token=None, *, attention_callback=None):
+        """Advance one position; optionally consume this query's attention weights.
+
+        The callback is used by single-sample visualization with SDPA/eager only.
+        Prefill never requests attention matrices. Normal evaluation is unchanged.
+        """
         torch = self.torch
         if token is None:
             # Final normalized decoder hidden -> next continuous input, exactly
@@ -229,7 +234,11 @@ class QwenBackbone:
         positions = torch.full((3, 1, 1), state["next_position"], device=self.input_device, dtype=torch.long)
         output = self.model.model(inputs_embeds=embeds, attention_mask=mask, position_ids=positions,
                                   past_key_values=state["cache"], use_cache=True, return_dict=True,
-                                  cache_position=torch.tensor([state["length"]], device=self.input_device), **self.decoder_kwargs)
+                                  cache_position=torch.tensor([state["length"]], device=self.input_device),
+                                  **({"output_attentions": True} if attention_callback is not None else {}),
+                                  **self.decoder_kwargs)
+        if attention_callback is not None:
+            attention_callback(output.attentions)
         return {"hidden": output.last_hidden_state[:, -1:].clone(), "cache": output.past_key_values,
                 "mask": mask, "next_position": state["next_position"] + 1, "length": state["length"] + 1}
 

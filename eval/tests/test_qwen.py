@@ -135,6 +135,59 @@ def test_generation_runs_for_base_and_latent_backbone(backend, checkpoint, tmp_p
     assert result["latent_segments"] == [] and 7 not in result["token_ids"] and 8 not in result["token_ids"]
 
 
+def test_latent_attention_callback_matches_eager_and_preserves_recurrence(backend, tmp_path):
+    from eval.latent_attention import extract_image_attention, image_layout
+    with torch.inference_mode():
+        inputs = backend._inputs(messages(tmp_path))
+        layout = image_layout(inputs['input_ids'][0].numpy(), inputs['image_grid_thw'].tolist(),
+                              backend.model.config.image_token_id, backend.processor.image_processor.merge_size, ['test.png'])
+        captured = []
+        # Independent caches: cache objects are mutated in-place by attention.
+        plain = backend.advance(backend._prefill(inputs), 7)
+        observed = backend.advance(backend._prefill(inputs), 7)
+        plain = backend.advance(plain)
+        observed = backend.advance(observed, attention_callback=lambda a: captured.append(a))
+        torch.testing.assert_close(observed['hidden'], plain['hidden'], atol=2e-6, rtol=2e-5)
+        assert len(captured) == 1
+        maps = extract_image_attention(captured[0], layout, [0, 1])
+        assert maps['image_001'].shape == (2, 2, 2)
+        for i in [0, 1]:
+            expected = captured[0][i][0, :, 0, layout[0]['token_start']:layout[0]['token_end']].float().mean(0)
+            torch.testing.assert_close(torch.from_numpy(maps['image_001'][i].reshape(-1)), expected)
+            assert 0 < maps['image_001'][i].sum() < 1
+
+
+def test_single_score_attention_end_to_end(checkpoint, tmp_path):
+    import json
+    from PIL import Image
+    from eval.common import write_json
+    from eval.latent_attention import visualize_record
+    from eval.protocols import messages_for
+    prepared = tmp_path / 'datasets/mmstar/prepared'
+    (prepared / 'images').mkdir(parents=True)
+    Image.new('RGB', (56, 56), 'red').save(prepared / 'images/test.png')
+    sample = {'id': '1376', 'benchmark': 'mmstar', 'question': 'Which?', 'answer': 'A',
+              'choices': {'A': 'red', 'B': 'blue'}, 'meta': {}, 'images': {'image_1': 'images/test.png'}}
+    backend = QwenBackbone(checkpoint, device='cpu', dtype='float32', attention='sdpa', max_new_steps=16)
+    inputs = backend._inputs(messages_for(sample, prepared))
+    prediction = {'method': 'generation', 'token_ids': [7, 8, 2], 'decode_steps': 4,
+                  'stopped_on_eos': True, 'truncated': False, 'text': '',
+                  'prompt_tokens': inputs['input_ids'].shape[1], 'image_grid_thw': inputs['image_grid_thw'].tolist(),
+                  'latent_segments': [{'start_step': 0, 'steps': 2, 'end_step': 3, 'closed': True, 'forced_end': False}]}
+    run = tmp_path / 'eval/sft3eval/mmstar/00000001'
+    write_json(run / 'inference_config.json', {'model': {'path': str(checkpoint)}, 'dtype': 'float32', 'max_new_steps': 16})
+    write_json(run / 'scores/00000001/00001365.json', {'id': '1376', 'status': 'ok', 'identity': ['00000001', prediction, sample]})
+    output = visualize_record(eval_root=tmp_path / 'eval', run_name='sft3eval', dataset='mmstar',
+        inference_id='00000001', score_id='00000001', record_kind='scores', file_id=1365,
+        dataset_dir=tmp_path / 'datasets', model_dir=None, device='cpu', layers=[-2, -1], output_dir=tmp_path / 'out')
+    manifest = json.loads((output / 'manifest.json').read_text(encoding='utf8'))
+    assert manifest['complete'] and len(manifest['frames']) == 2
+    assert manifest['sample_id'] == '1376' and manifest['record_file'].endswith('00001365.json')
+    assert len(list((output / 'overlays').glob('*.png'))) == 2
+    assert [frame['decode_step'] for frame in manifest['frames']] == [1, 2]
+    assert (output / 'index.html').is_file()
+
+
 def test_actual_stage3_export_loads_and_matches_23_step_recurrence(checkpoint, tmp_path):
     from types import SimpleNamespace
     from src.sft3.checkpoint import export_stage3
